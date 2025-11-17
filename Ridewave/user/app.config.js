@@ -1,15 +1,17 @@
 import "dotenv/config";
 
-const sharedMapsApiKey =
-  process.env.GOOGLE_MAPS_ANDROID_KEY ??
-  process.env.GOOGLE_MAPS_IOS_KEY ??
-  process.env.EXPO_PUBLIC_GOOGLE_CLOUD_API_KEY ??
-  "";
+// Use the correct env vars for Google Maps native SDK keys.
+// For Android builds, use EXPO_GOOGLE_MAPS_ANDROID_KEY (or fallback to GOOGLE_MAPS_ANDROID_KEY).
+// For iOS builds, use EXPO_GOOGLE_MAPS_IOS_KEY (or fallback to GOOGLE_MAPS_IOS_KEY).
+const ANDROID_MAPS_API_KEY =
+  process.env.EXPO_GOOGLE_MAPS_ANDROID_KEY ?? process.env.GOOGLE_MAPS_ANDROID_KEY ?? "";
+const IOS_MAPS_API_KEY =
+  process.env.EXPO_GOOGLE_MAPS_IOS_KEY ?? process.env.GOOGLE_MAPS_IOS_KEY ?? "";
 
 export default {
   expo: {
     name: "Flashride",
-    slug: "flashride",
+    slug: "flashride-user",
     version: "1.0.0",
     orientation: "portrait",
     icon: "./assets/icon.png",
@@ -23,9 +25,9 @@ export default {
     ios: {
       supportsTablet: true,
       bundleIdentifier: "com.flashride.user",
-      config: sharedMapsApiKey
+      config: IOS_MAPS_API_KEY
         ? {
-            googleMapsApiKey: sharedMapsApiKey,
+            googleMapsApiKey: IOS_MAPS_API_KEY,
           }
         : undefined,
     },
@@ -35,10 +37,10 @@ export default {
         backgroundColor: "#ffffff",
       },
       package: "com.flashride.user",
-      config: sharedMapsApiKey
+      config: ANDROID_MAPS_API_KEY
         ? {
             googleMaps: {
-              apiKey: sharedMapsApiKey,
+              apiKey: ANDROID_MAPS_API_KEY,
             },
           }
         : undefined,
@@ -61,7 +63,7 @@ export default {
     },
     extra: {
       eas: {
-        projectId: "6cdffa57-e0c7-4571-bbe8-7b3c97422bc2",
+        projectId: "f2fcc533-6353-4af7-866a-f41310252bda",
       },
       // Explicitly expose Supabase environment variables
       EXPO_PUBLIC_SUPABASE_URL: process.env.EXPO_PUBLIC_SUPABASE_URL,

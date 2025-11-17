@@ -22,4 +22,5 @@ export const slides = [
   },
 ];
 
-export const ws = new WebSocket("ws://192.168.1.2:8080");
+// WebSocket is now initialized in components that need it
+// This export is removed to avoid creating WebSocket at module level

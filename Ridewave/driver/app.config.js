@@ -8,8 +8,8 @@ const sharedMapsApiKey =
 
 export default {
   expo: {
-    name: "Flashride Driver",
-    slug: "flashride-driver",
+    name: "Flashride",
+    slug: "flashride",
     version: "1.0.0",
     orientation: "portrait",
     icon: "./assets/icon.png",
@@ -60,7 +60,7 @@ export default {
     },
     extra: {
       eas: {
-        projectId: "6cdffa57-e0c7-4571-bbe8-7b3c97422bc2",
+        projectId: "e0f929ef-0efd-437f-a415-cb1fa23e155a",
       },
     },
   },

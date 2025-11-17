@@ -41,17 +41,16 @@ export default function RidePlanScreen() {
   const [wsConnected, setWsConnected] = useState(false);
   const [places, setPlaces] = useState<any>([]);
   const [query, setQuery] = useState("");
-  const [region, setRegion] = useState<any>({
-    latitude: 37.78825,
-    longitude: -122.4324,
-    latitudeDelta: 0.0922,
-    longitudeDelta: 0.0421,
-  });
+  const [region, setRegion] = useState<any>(null); // Start with null, will be set when we get real location
+  const [locationLoading, setLocationLoading] = useState(true); // Track if we're still loading location
   const [marker, setMarker] = useState<any>(null);
   const [currentLocation, setCurrentLocation] = useState<any>(null);
   const [distance, setDistance] = useState<any>(null);
   const [locationSelected, setlocationSelected] = useState(false);
   const [selectedVehcile, setselectedVehcile] = useState("Car");
+  const [vehicleSelectionVisible, setVehicleSelectionVisible] = useState(false);
+  const [showConfirmSelection, setShowConfirmSelection] = useState(false);
+  const [selectedVehicleImage, setSelectedVehicleImage] = useState<any>(null);
   const [travelTimes, setTravelTimes] = useState({
     driving: null,
     walking: null,
@@ -63,6 +62,7 @@ export default function RidePlanScreen() {
   const [selectedDriver, setselectedDriver] = useState<DriverType>();
   const [driverLoader, setdriverLoader] = useState(false);
   const driverTimeoutRef = useRef<any>(null);
+  const [assignedRide, setAssignedRide] = useState<any>(null); // set when driver accepts
 
   // Only set up notifications if not in Expo Go
   useEffect(() => {
@@ -112,50 +112,141 @@ export default function RidePlanScreen() {
 
   useEffect(() => {
     (async () => {
-      let { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== "granted") {
+      try {
+        setLocationLoading(true);
+        console.log('📍 Requesting location permission...');
+        
+        let { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== "granted") {
+          console.error('❌ Location permission denied');
+          Toast.show(
+            "Please approve your location tracking otherwise you can't use this app!",
+            {
+              type: "danger",
+              placement: "bottom",
+            }
+          );
+          setLocationLoading(false);
+          return;
+        }
+
+        console.log('📍 Getting current location...');
+        let location = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.High,
+        });
+        
+        const { latitude, longitude } = location.coords;
+        console.log(`✅ Got location: (${latitude}, ${longitude})`);
+        
+        setCurrentLocation({ latitude, longitude });
+        setRegion({
+          latitude,
+          longitude,
+          latitudeDelta: 0.0922,
+          longitudeDelta: 0.0421,
+        });
+        setLocationLoading(false);
+      } catch (error: any) {
+        console.error('❌ Failed to get location:', error?.message || error);
+        setLocationLoading(false);
         Toast.show(
-          "Please approve your location tracking otherwise you can't use this app!",
+          "Failed to get your location. Please check your GPS settings and try again.",
           {
             type: "danger",
             placement: "bottom",
           }
         );
+        // Fallback to Nouakchott, Mauritania (capital) if location fails
+        const nouakchottLocation = {
+          latitude: 18.0735,
+          longitude: -15.9582,
+          latitudeDelta: 0.0922,
+          longitudeDelta: 0.0421,
+        };
+        setRegion(nouakchottLocation);
+        setCurrentLocation({ latitude: nouakchottLocation.latitude, longitude: nouakchottLocation.longitude });
       }
-
-      let location = await Location.getCurrentPositionAsync({
-        accuracy: Location.Accuracy.High,
-      });
-      const { latitude, longitude } = location.coords;
-      setCurrentLocation({ latitude, longitude });
-      setRegion({
-        latitude,
-        longitude,
-        latitudeDelta: 0.0922,
-        longitudeDelta: 0.0421,
-      });
     })();
   }, []);
 
+  // Get WebSocket URL - handle Android emulator and physical device
+  const getWebSocketUrl = () => {
+    // Check if WebSocket URL is configured in environment
+    const wsUrl = process.env.EXPO_PUBLIC_WEBSOCKET_URL;
+    if (wsUrl) {
+      return wsUrl;
+    }
+    
+    // For Android emulator, use 10.0.2.2 to reach host machine
+    // For physical device, use the server IP from SERVER_URI
+    if (Platform.OS === 'android') {
+      // Try to extract IP from SERVER_URI, fallback to emulator address
+      const serverUri = process.env.EXPO_PUBLIC_SERVER_URI || '';
+      const ipMatch = serverUri.match(/http:\/\/([^:]+)/);
+      if (ipMatch && ipMatch[1] && !ipMatch[1].includes('localhost')) {
+        return `ws://${ipMatch[1]}:8080`;
+      }
+      // Default to emulator address for Android
+      return 'ws://10.0.2.2:8080';
+    }
+    
+    // For iOS or web, try to extract from SERVER_URI or use localhost
+    const serverUri = process.env.EXPO_PUBLIC_SERVER_URI || '';
+    const ipMatch = serverUri.match(/http:\/\/([^:]+)/);
+    if (ipMatch && ipMatch[1]) {
+      return `ws://${ipMatch[1]}:8080`;
+    }
+    
+    // Fallback
+    return 'ws://localhost:8080';
+  };
+
   const initializeWebSocket = () => {
-    ws.current = new WebSocket("ws://192.168.1.2:8080");
-    ws.current.onopen = () => {
-      console.log("Connected to websocket server");
-      setWsConnected(true);
-    };
+    const wsUrl = getWebSocketUrl();
+    console.log('🔌 Connecting to WebSocket:', wsUrl);
+    
+    try {
+      ws.current = new WebSocket(wsUrl);
+      ws.current.onopen = () => {
+        console.log("✅ Connected to WebSocket server");
+        setWsConnected(true);
+        // Identify this user so server can forward accept events
+        try {
+          if (user?.id) {
+            ws.current?.send(
+              JSON.stringify({
+                type: "identify",
+                role: "user",
+                userId: user.id,
+              })
+            );
+            console.log("🪪 Identified to WS as user:", user.id);
+          }
+        } catch {}
+      };
 
-    ws.current.onerror = (e: any) => {
-      console.log("WebSocket error:", e.message);
-    };
+      ws.current.onerror = (e: any) => {
+        console.error("❌ WebSocket error:", e.message || 'Connection failed');
+        setWsConnected(false);
+      };
 
-    ws.current.onclose = (e: any) => {
-      console.log("WebSocket closed:", e.code, e.reason);
+      ws.current.onclose = (e: any) => {
+        console.log("🔌 WebSocket closed:", e.code, e.reason || 'Connection closed');
+        setWsConnected(false);
+        // Attempt to reconnect after a delay (only if not manually closed)
+        if (e.code !== 1000) {
+          setTimeout(() => {
+            if (ws.current?.readyState !== WebSocket.OPEN) {
+              console.log('🔄 Attempting to reconnect WebSocket...');
+              initializeWebSocket();
+            }
+          }, 5000);
+        }
+      };
+    } catch (error) {
+      console.error('❌ Failed to create WebSocket:', error);
       setWsConnected(false);
-      // Attempt to reconnect after a delay
-      setTimeout(() => {
-        initializeWebSocket();
-      }, 5000);
-    };
+    }
   };
 
   useEffect(() => {
@@ -340,8 +431,10 @@ export default function RidePlanScreen() {
       
       // Show loading state immediately
       setlocationSelected(true);
-      setdriverLoader(true);
+      // Do NOT search yet; first let the user pick vehicle type
+      setdriverLoader(false);
       setdriverLists([]);
+      setVehicleSelectionVisible(true);
       setPlaces([]);
       setkeyboardAvoidingHeight(false);
 
@@ -386,10 +479,7 @@ export default function RidePlanScreen() {
         });
       }
 
-      // Request nearby drivers
-      requestNearbyDrivers();
-      
-      console.log("[handlePlaceSelect] Destination set, requesting drivers...");
+      console.log("[handlePlaceSelect] Destination set, awaiting vehicle selection...");
     } catch (error: any) {
       console.error("[handlePlaceSelect] Error:", error);
       setdriverLoader(false);
@@ -402,6 +492,32 @@ export default function RidePlanScreen() {
         }
       );
     }
+  };
+
+  // Simple vehicle options (can be replaced by backend-provided catalog later)
+  const vehicleOptions = [
+    {
+      type: "Car",
+      image: require("@/assets/images/vehicles/car.png"),
+    },
+    {
+      type: "Motorcycle",
+      image: require("@/assets/images/vehicles/bike.png"),
+    },
+  ];
+
+  const handleVehicleSelect = (type: string, image: any) => {
+    setselectedVehcile(type);
+    setSelectedVehicleImage(image);
+    setShowConfirmSelection(true);
+  };
+
+  const confirmVehicleSelection = () => {
+    // Start searching for driver only after confirmation
+    setShowConfirmSelection(false);
+    setVehicleSelectionVisible(false);
+    setdriverLoader(true);
+    requestNearbyDrivers();
   };
 
   const calculateDistance = (lat1: any, lon1: any, lat2: any, lon2: any) => {
@@ -466,6 +582,21 @@ export default function RidePlanScreen() {
               placement: "bottom",
             });
           }
+        }
+        // Driver accepted – transition UI
+        if (message.type === "rideAccepted" && message.payload) {
+          // Only react if this acceptance is for the logged-in user
+          const acceptedForUserId = message.payload?.user?.id;
+          if (acceptedForUserId && user?.id && acceptedForUserId !== user.id) {
+            return;
+          }
+          console.log("[WS] rideAccepted (for me):", message.payload);
+          setdriverLoader(false);
+          setAssignedRide(message.payload);
+          if (!marker && message.payload?.marker) {
+            setMarker(message.payload.marker);
+          }
+          Toast.show("Driver is on the way!", { type: "success", placement: "bottom" });
         }
       } catch (error) {
         console.error("[getNearbyDrivers] Error parsing websocket:", error);
@@ -608,7 +739,59 @@ export default function RidePlanScreen() {
     await axios.post("https://exp.host/--/api/v2/push/send", message);
   };
 
-  const handleOrder = async () => {
+  // Choose nearest driver from list; fall back to first
+  const pickNearestDriver = (drivers: any[]) => {
+    try {
+      if (!drivers || drivers.length === 0 || !currentLocation) return null;
+      let best = drivers[0];
+      let bestDist = Number.MAX_SAFE_INTEGER;
+      for (const d of drivers) {
+        const lat = d.latitude ?? d.lat ?? d.coords?.latitude;
+        const lon = d.longitude ?? d.lon ?? d.coords?.longitude;
+        if (typeof lat === "number" && typeof lon === "number") {
+          const dist = calculateDistance(currentLocation.latitude, currentLocation.longitude, lat, lon);
+          if (dist < bestDist) {
+            best = d;
+            bestDist = dist;
+          }
+        }
+      }
+      return best || drivers[0];
+    } catch {
+      return drivers[0];
+    }
+  };
+
+  const handleConfirmBooking = async () => {
+    try {
+      console.log("[ConfirmBooking] pressed. driverLists:", driverLists?.length);
+      // Immediately reflect UI state to "searching"
+      setdriverLoader(true);
+      setVehicleSelectionVisible(false);
+      // optional: collapse current list while searching to make the state obvious
+      // setdriverLists([]);
+
+      // If we don't have drivers yet, start search now
+      if (!driverLists || driverLists.length === 0) {
+        Toast.show("Searching for the nearest driver…", { placement: "bottom" });
+        requestNearbyDrivers();
+        return;
+      }
+      // We have drivers; send order to nearest/selected
+      const target = selectedDriver || pickNearestDriver(driverLists);
+      console.log("[ConfirmBooking] target driver:", target);
+      await handleOrder(target);
+    } catch (e: any) {
+      console.error("[ConfirmBooking] error:", e?.message || e);
+      Toast.show("Failed to confirm booking. Please try again.", {
+        type: "danger",
+        placement: "bottom",
+      });
+    }
+  };
+
+  const handleOrder = async (targetDriver?: any) => {
+    console.log("[handleOrder] sending to driver:", targetDriver?.id || targetDriver?._id || targetDriver?.driverId);
     const currentLocationName = await axios.get(
       `https://maps.googleapis.com/maps/api/geocode/json?latlng=${currentLocation?.latitude},${currentLocation?.longitude}&key=${process.env.EXPO_PUBLIC_GOOGLE_CLOUD_API_KEY}`
     );
@@ -626,9 +809,35 @@ export default function RidePlanScreen() {
       destinationLocation:
         destinationLocationName.data.results[0].formatted_address,
     };
-    const driverPushToken = "ExponentPushToken[v1e34ML-hnypD7MKQDDwaK]";
 
+    // Prefer driver's push token from API if available; fallback to demo token
+    const driverPushToken =
+      targetDriver?.pushToken ||
+      targetDriver?.expoPushToken ||
+      targetDriver?.notificationToken ||
+      "ExponentPushToken[v1e34ML-hnypD7MKQDDwaK]";
+
+    console.log("[handleOrder] push to token:", driverPushToken);
     await sendPushNotification(driverPushToken, JSON.stringify(data));
+
+    // Also notify driver via WebSocket channel for instant in-app modal
+    try {
+      if (ws.current && wsConnected) {
+        const targetId =
+          targetDriver?.id || targetDriver?._id || targetDriver?.driverId;
+        ws.current.send(
+          JSON.stringify({
+            type: "notifyDriver",
+            role: "user",
+            driverId: targetId,
+            payload: data,
+          })
+        );
+        console.log("[handleOrder] also notified via WS to driver:", targetId);
+      }
+    } catch (err) {
+      console.log("[handleOrder] WS notify failed:", err);
+    }
   };
 
   return (
@@ -640,23 +849,34 @@ export default function RidePlanScreen() {
         <View
           style={{ height: windowHeight(!keyboardAvoidingHeight ? 500 : 300) }}
         >
-          <MapView
-            style={{ flex: 1 }}
-            region={region}
-            onRegionChangeComplete={(region) => setRegion(region)}
-          >
-            {marker && <Marker coordinate={marker} />}
-            {currentLocation && <Marker coordinate={currentLocation} />}
-            {currentLocation && marker && (
-              <MapViewDirections
-                origin={currentLocation}
-                destination={marker}
-                apikey={process.env.EXPO_PUBLIC_GOOGLE_CLOUD_API_KEY!}
-                strokeWidth={4}
-                strokeColor="blue"
-              />
-            )}
-          </MapView>
+          {locationLoading || !region ? (
+            <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#f5f5f5' }}>
+              <ActivityIndicator size="large" color="#000" />
+              <Text style={{ marginTop: 10, fontSize: 16, color: '#666' }}>
+                Getting your location...
+              </Text>
+            </View>
+          ) : (
+            <MapView
+              style={{ flex: 1 }}
+              region={region}
+              onRegionChangeComplete={(region) => setRegion(region)}
+              showsUserLocation={true}
+              showsMyLocationButton={true}
+            >
+              {marker && <Marker coordinate={marker} />}
+              {currentLocation && <Marker coordinate={currentLocation} />}
+              {currentLocation && marker && (
+                <MapViewDirections
+                  origin={currentLocation}
+                  destination={marker}
+                  apikey={process.env.EXPO_PUBLIC_GOOGLE_CLOUD_API_KEY!}
+                  strokeWidth={4}
+                  strokeColor="blue"
+                />
+              )}
+            </MapView>
+          )}
         </View>
       </View>
       <View style={styles.contentContainer}>
@@ -676,6 +896,8 @@ export default function RidePlanScreen() {
                   setlocationSelected(false);
                   setdriverLoader(false);
                   setdriverLists([]);
+                  setVehicleSelectionVisible(false);
+                  setShowConfirmSelection(false);
                   if (driverTimeoutRef.current) {
                     clearTimeout(driverTimeoutRef.current);
                     driverTimeoutRef.current = null;
@@ -690,10 +912,81 @@ export default function RidePlanScreen() {
                     fontWeight: "600",
                   }}
                 >
-                  Gathering options
+                  {vehicleSelectionVisible
+                    ? "Select a ride"
+                    : driverLoader
+                    ? "Searching for driver"
+                    : assignedRide
+                    ? "Driver is on the way"
+                    : "Gathering options"}
                 </Text>
               </View>
-              {driverLoader ? (
+
+              {/* Vehicle selection step */}
+              {vehicleSelectionVisible && !driverLoader && (
+                <View
+                  style={{
+                    padding: windowWidth(12),
+                  }}
+                >
+                  <Text style={{ fontSize: 18, fontWeight: "600", marginBottom: 12 }}>
+                    Choose your car type
+                  </Text>
+                  <View style={{ flexDirection: "row", gap: 12 }}>
+                    {vehicleOptions.map((opt) => (
+                      <Pressable
+                        key={opt.type}
+                        onPress={() => handleVehicleSelect(opt.type, opt.image)}
+                        style={{
+                          flex: 1,
+                          borderWidth: selectedVehcile === opt.type ? 2 : 1,
+                          borderColor: selectedVehcile === opt.type ? "#111" : "#ddd",
+                          borderRadius: 12,
+                          padding: 12,
+                          alignItems: "center",
+                          backgroundColor: "#fff",
+                        }}
+                      >
+                        <Image source={opt.image} style={{ width: 100, height: 90 }} />
+                        <Text style={{ marginTop: 8, fontSize: 16, fontWeight: "600" }}>{opt.type}</Text>
+                      </Pressable>
+                    ))}
+                  </View>
+
+                  {selectedVehicleImage && (
+                    <View style={{ alignItems: "center", marginTop: 16 }}>
+                      <Image source={selectedVehicleImage} style={{ width: 140, height: 120 }} />
+                      <Text style={{ marginTop: 6 }}>Selected: {selectedVehcile}</Text>
+                    </View>
+                  )}
+
+                  {/* Confirmation prompt */}
+                  {showConfirmSelection && (
+                    <View style={{ marginTop: 20 }}>
+                      <Text style={{ textAlign: "center", fontSize: 16, marginBottom: 10 }}>
+                        Confirm {selectedVehcile} and start searching for a driver?
+                      </Text>
+                      <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
+                        <Pressable
+                          onPress={() => setShowConfirmSelection(false)}
+                          style={{ flex: 1, marginRight: 8, padding: 12, borderRadius: 10, borderWidth: 1, borderColor: "#ddd", alignItems: "center" }}
+                        >
+                          <Text>Cancel</Text>
+                        </Pressable>
+                        <Pressable
+                          onPress={confirmVehicleSelection}
+                          style={{ flex: 1, marginLeft: 8, padding: 12, borderRadius: 10, backgroundColor: "#111", alignItems: "center" }}
+                        >
+                          <Text style={{ color: "#fff", fontWeight: "600" }}>Confirm</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+                  )}
+                </View>
+              )}
+
+              {/* Searching state */}
+              {driverLoader && (
                 <View
                   style={{
                     flex: 1,
@@ -711,10 +1004,13 @@ export default function RidePlanScreen() {
                       color: "#666",
                     }}
                   >
-                    Finding available drivers...
+                    Searching for driver...
                   </Text>
                 </View>
-              ) : (
+              )}
+
+              {/* Driver options after search returns */}
+              {!vehicleSelectionVisible && !driverLoader && (
                 <ScrollView
                   style={{
                     paddingBottom: windowHeight(20),
@@ -723,8 +1019,14 @@ export default function RidePlanScreen() {
                 >
                   <View style={{ padding: windowWidth(10) }}>
                     {driverLists && driverLists.length > 0 ? (
-                      driverLists.map((driver: DriverType) => (
+                      driverLists.map((driver: DriverType, index: number) => (
                       <Pressable
+                        key={
+                          (driver as any)?.id ||
+                          (driver as any)?._id ||
+                          (driver as any)?.driverId ||
+                          `driver-${index}`
+                        }
                         style={{
                           width: windowWidth(420),
                           borderWidth:
@@ -757,9 +1059,9 @@ export default function RidePlanScreen() {
                           }}
                         >
                           <View>
-                            <Text style={{ fontSize: 20, fontWeight: "600" }}>
-                              Flashride {driver?.vehicle_type}
-                            </Text>
+                    <Text style={{ fontSize: 20, fontWeight: "600" }}>
+                      Flashride {driver?.vehicle_type}
+                    </Text>
                             <Text style={{ fontSize: 16 }}>
                               {getEstimatedArrivalTime(travelTimes.driving)}{" "}
                               dropoff
@@ -811,7 +1113,19 @@ export default function RidePlanScreen() {
                       </View>
                     )}
 
-                    {driverLists && driverLists.length > 0 && (
+                    {/* When a driver is assigned, show a status bar */}
+                    {assignedRide && (
+                      <View style={{ paddingHorizontal: windowWidth(10), marginTop: windowHeight(10) }}>
+                        <Text style={{ fontSize: 16, fontWeight: "600" }}>
+                          Driver is on the way
+                        </Text>
+                        <Text style={{ color: "#666" }}>
+                          {assignedRide?.driver?.name || "Your driver"} is heading to your pickup
+                        </Text>
+                      </View>
+                    )}
+
+                    {driverLists && driverLists.length > 0 && !assignedRide && (
                       <View
                         style={{
                           paddingHorizontal: windowWidth(10),
@@ -822,7 +1136,8 @@ export default function RidePlanScreen() {
                           backgroundColor={"#000"}
                           textColor="#fff"
                           title={`Confirm Booking`}
-                          onPress={() => handleOrder()}
+                          onPress={handleConfirmBooking}
+                          disabled={driverLoader}
                         />
                       </View>
                     )}
