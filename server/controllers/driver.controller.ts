@@ -342,13 +342,20 @@ export const newRide = async (req: any, res: Response) => {
       distance,
     } = req.body;
 
-    // Check if a ride already exists for this user with status "Processing" or "Accepted"
-    // This prevents duplicate rides when multiple drivers try to accept the same request
+    // SILICON VALLEY APPROACH: Only check for VERY recent rides (last 5 minutes)
+    // This prevents false positives from old/completed rides that weren't cleaned up
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+    
+    console.log(`🔍 [newRide] Checking for recent rides (last 5 min) for user ${userId}, driver ${req.driver.id}...`);
+    
     const existingRide = await prisma.rides.findFirst({
       where: {
         userId,
         status: {
-          in: ["Processing", "Accepted", "On the way", "Picked up"],
+          in: ["Accepted", "Processing", "On the way", "Picked up"], // "Accepted" is the primary status now
+        },
+        cratedAt: {
+          gte: fiveMinutesAgo, // Only check rides created in last 5 minutes
         },
       },
       orderBy: {
@@ -357,20 +364,23 @@ export const newRide = async (req: any, res: Response) => {
     });
 
     if (existingRide) {
-      console.log(`⚠️ Duplicate ride attempt detected for user ${userId}. Existing ride: ${existingRide.id}, Driver: ${existingRide.driverId}`);
+      console.log(`⚠️ [newRide] Recent ride found for user ${userId}. Ride ID: ${existingRide.id}, Driver: ${existingRide.driverId}, Created: ${existingRide.cratedAt}, Status: ${existingRide.status}`);
       
       // If the existing ride is from a different driver, reject this request
       if (existingRide.driverId !== req.driver.id) {
+        console.log(`❌ [newRide] Driver ${req.driver.id} tried to create ride, but recent ride exists for driver ${existingRide.driverId}`);
         return res.status(409).json({
           success: false,
           message: "This ride request was already accepted by another driver.",
         });
       }
       
-      // If it's the same driver, return the existing ride (idempotency)
-      console.log(`ℹ️ Same driver attempting to create duplicate ride, returning existing ride`);
+      // If it's the same driver, return the existing ride (idempotency - allows retries)
+      console.log(`ℹ️ [newRide] Same driver ${req.driver.id} attempting to create duplicate ride, returning existing ride (idempotency)`);
       return res.status(200).json({ success: true, newRide: existingRide });
     }
+    
+    console.log(`✅ [newRide] No recent ride found, creating new ride for user ${userId} by driver ${req.driver.id}`);
 
     const newRide = await prisma.rides.create({
       data: {
@@ -406,43 +416,74 @@ export const updatingRideStatus = async (req: any, res: Response) => {
   try {
     const { rideId, rideStatus } = req.body;
 
+    console.log(`[updateRideStatus] Request received:`, {
+      rideId,
+      rideStatus,
+      driverId: req.driver?.id,
+      hasRideId: !!rideId,
+      hasRideStatus: !!rideStatus,
+    });
+
     // Validate input
     if (!rideId || !rideStatus) {
+      console.error(`[updateRideStatus] Invalid input:`, { rideId, rideStatus });
       return res
         .status(400)
-        .json({ success: false, message: "Invalid input data" });
+        .json({ success: false, message: "Invalid input data. Ride ID and status are required." });
     }
 
     const driverId = req.driver?.id;
     if (!driverId) {
+      console.error(`[updateRideStatus] No driver ID in request`);
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
     // Fetch the ride data to get the rideCharge
     const ride = await prisma.rides.findUnique({
       where: {
-        id: rideId,
+        id: String(rideId), // Ensure it's a string
       },
     });
 
     if (!ride) {
+      console.error(`[updateRideStatus] Ride not found:`, { rideId, driverId });
       return res
         .status(404)
         .json({ success: false, message: "Ride not found" });
     }
+    
+    console.log(`[updateRideStatus] Ride found:`, {
+      rideId: ride.id,
+      currentStatus: ride.status,
+      requestedStatus: rideStatus,
+      rideDriverId: ride.driverId,
+      requestDriverId: driverId,
+      driverMatches: ride.driverId === driverId,
+    });
 
     const rideCharge = ride.charge;
 
+    // Verify the ride belongs to this driver before updating
+    if (ride.driverId !== driverId) {
+      console.log(`[updateRideStatus] Driver ${driverId} tried to update ride ${rideId} owned by driver ${ride.driverId}`);
+      return res.status(403).json({
+        success: false,
+        message: "You are not authorized to update this ride",
+      });
+    }
+    
     // Update ride status
     const updatedRide = await prisma.rides.update({
       where: {
         id: rideId,
-        driverId,
+        driverId, // Ensure driver owns this ride
       },
       data: {
         status: rideStatus,
       },
     });
+    
+    console.log(`[updateRideStatus] Ride ${rideId} status updated from ${ride.status} to ${rideStatus} by driver ${driverId}`);
 
     if (rideStatus === "Completed") {
       // Get current driver data to check wallet status

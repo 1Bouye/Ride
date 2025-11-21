@@ -1,5 +1,5 @@
 import { View, Text, Linking, TouchableOpacity } from "react-native";
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { router, useLocalSearchParams } from "expo-router";
 import { fontSizes, windowHeight, windowWidth } from "@/themes/app.constant";
 import MapView, { Marker } from "react-native-maps";
@@ -13,8 +13,14 @@ import * as GeoLocation from "expo-location";
 
 export default function RideDetailsScreen() {
   const { orderData: orderDataObj } = useLocalSearchParams() as any;
-  const [orderStatus, setorderStatus] = useState("Processing");
+  const [orderStatus, setorderStatus] = useState("Accepted"); // Changed from "Processing" - rides are directly accepted
   const orderData = JSON.parse(orderDataObj);
+  
+  // Extract stable values from orderData to use in effects
+  const pickupLocation = orderData?.currentLocation;
+  const destinationLocation = orderData?.marker;
+  const initialDriverLocation = orderData?.driverLocation;
+  
   const [region, setRegion] = useState<any>({
     latitude: 37.78825,
     longitude: -122.4324,
@@ -26,16 +32,22 @@ export default function RideDetailsScreen() {
   // Driver's current location
   // Use driver location from orderData if available (passed from home screen), otherwise fetch it
   const [driverLocation, setDriverLocation] = useState<any>(
-    orderData?.driverLocation || null
+    initialDriverLocation || null
   );
+  
+  // Refs to prevent infinite loops
+  const regionInitializedRef = useRef(false);
+  const lastRegionUpdateRef = useRef<string>("");
 
   // Get driver's current location and keep it updated (especially important after pickup)
   useEffect(() => {
     // If driver location was already passed, use it initially
-    if (orderData?.driverLocation) {
-      console.log("[RideDetails] Using driver location from orderData:", orderData.driverLocation);
-      setDriverLocation(orderData.driverLocation);
+    if (initialDriverLocation) {
+      console.log("[RideDetails] Using driver location from orderData:", initialDriverLocation);
+      setDriverLocation(initialDriverLocation);
     }
+    
+    let subscription: any = null;
     
     // Always set up location tracking to keep driver location updated
     (async () => {
@@ -51,7 +63,7 @@ export default function RideDetailsScreen() {
           console.log("[RideDetails] Got driver location:", { latitude, longitude });
           
           // Watch position to keep driver location updated (especially after pickup)
-          const subscription = await GeoLocation.watchPositionAsync(
+          subscription = await GeoLocation.watchPositionAsync(
             {
               accuracy: GeoLocation.Accuracy.Balanced,
               timeInterval: 5000, // Update every 5 seconds
@@ -63,156 +75,227 @@ export default function RideDetailsScreen() {
               console.log("[RideDetails] Driver location updated:", { latitude, longitude });
             }
           );
-          
-          // Cleanup subscription on unmount
-          return () => {
-            if (subscription) {
-              subscription.remove();
-            }
-          };
         }
       } catch (error) {
         console.error("[RideDetails] Failed to get/update driver location:", error);
       }
     })();
-  }, []);
+    
+    // Cleanup subscription on unmount
+    return () => {
+      if (subscription) {
+        subscription.remove();
+      }
+    };
+  }, []); // Only run once on mount
 
-  // Initialize status and region on mount
-  // Show pickup location immediately, even if driver location isn't ready yet
+  // Initialize status on mount (only once)
   useEffect(() => {
-    const status = orderData?.rideData?.status || "Processing";
+    // Get status from rideData, default to "Accepted" (new rides are directly accepted)
+    const status = orderData?.rideData?.status || "Accepted";
+    console.log(`[RideDetails] Initializing with status: ${status}`);
     setorderStatus(status);
-    
-    // Always show pickup location immediately
-    if (orderData?.currentLocation) {
-      if (status === "Processing") {
-        // Before pickup: Show pickup location immediately, adjust when driver location is available
-        if (driverLocation) {
-          // Calculate region to show both points
-          const latitudeDelta = Math.abs(
-            driverLocation.latitude - orderData.currentLocation.latitude
-          ) * 2.2;
-          const longitudeDelta = Math.abs(
-            driverLocation.longitude - orderData.currentLocation.longitude
-          ) * 2.2;
-          
-          setRegion({
-            latitude: (driverLocation.latitude + orderData.currentLocation.latitude) / 2,
-            longitude: (driverLocation.longitude + orderData.currentLocation.longitude) / 2,
-            latitudeDelta: Math.max(latitudeDelta, 0.0922),
-            longitudeDelta: Math.max(longitudeDelta, 0.0421),
-          });
-        } else {
-          // Show pickup location immediately (driver location will be fetched)
-          setRegion({
-            latitude: orderData.currentLocation.latitude,
-            longitude: orderData.currentLocation.longitude,
-            latitudeDelta: 0.0922,
-            longitudeDelta: 0.0421,
-          });
-        }
-      } else if (status === "Ongoing") {
-        // After pickup: Show both pickup and destination
-        if (orderData?.currentLocation && orderData?.marker) {
-          const latitudeDelta = Math.abs(
-            orderData.currentLocation.latitude - orderData.marker.latitude
-          ) * 2.2;
-          const longitudeDelta = Math.abs(
-            orderData.currentLocation.longitude - orderData.marker.longitude
-          ) * 2.2;
-          
-          setRegion({
-            latitude: (orderData.currentLocation.latitude + orderData.marker.latitude) / 2,
-            longitude: (orderData.currentLocation.longitude + orderData.marker.longitude) / 2,
-            latitudeDelta: Math.max(latitudeDelta, 0.0922),
-            longitudeDelta: Math.max(longitudeDelta, 0.0421),
-          });
-        } else if (orderData?.marker) {
-          setRegion({
-            latitude: orderData.marker.latitude,
-            longitude: orderData.marker.longitude,
-            latitudeDelta: 0.0922,
-            longitudeDelta: 0.0421,
-          });
-        }
-      }
-    }
-  }, [driverLocation, orderData]); // Run when driver location is available or orderData changes
+  }, []); // Only run once on mount
 
-  // Update region when orderStatus changes
+  // Update region based on status and available locations (with guards to prevent infinite loops)
   useEffect(() => {
-    console.log(`[RideDetails] Status changed to: ${orderStatus}`);
+    // Create a unique key for this update to prevent duplicate updates
+    const updateKey = `${orderStatus}-${driverLocation?.latitude?.toFixed(4)}-${driverLocation?.longitude?.toFixed(4)}`;
     
-    if (orderStatus === "Processing") {
-      // Before pickup: Show both driver location and pickup location
-      if (orderData?.currentLocation && driverLocation) {
-        // Calculate region to show both points
+    // Skip if we've already processed this exact update
+    if (lastRegionUpdateRef.current === updateKey) {
+      return;
+    }
+    
+    console.log(`[RideDetails] Updating region for status: ${orderStatus}`);
+    
+    if (orderStatus === "Accepted" || orderStatus === "Processing") {
+      // Before pickup: Show driver location → pickup location
+      // Support both "Accepted" (new) and "Processing" (legacy) for backward compatibility
+      if (pickupLocation && driverLocation) {
         const latitudeDelta = Math.abs(
-          driverLocation.latitude - orderData.currentLocation.latitude
+          driverLocation.latitude - pickupLocation.latitude
         ) * 2.2;
         const longitudeDelta = Math.abs(
-          driverLocation.longitude - orderData.currentLocation.longitude
-        ) * 2.2;
-        
-        setRegion({
-          latitude: (driverLocation.latitude + orderData.currentLocation.latitude) / 2,
-          longitude: (driverLocation.longitude + orderData.currentLocation.longitude) / 2,
-          latitudeDelta: Math.max(latitudeDelta, 0.0922),
-          longitudeDelta: Math.max(longitudeDelta, 0.0421),
-        });
-      } else if (orderData?.currentLocation) {
-        // Fallback: just show pickup location if driver location not available
-        setRegion({
-          latitude: orderData.currentLocation.latitude,
-          longitude: orderData.currentLocation.longitude,
-          latitudeDelta: 0.0922,
-          longitudeDelta: 0.0421,
-        });
-      }
-    } else if (orderStatus === "Ongoing") {
-      // After pickup: Show driver's current location and destination
-      console.log(`[RideDetails] Status is Ongoing, updating region to show driver location and destination`);
-      if (driverLocation && orderData?.marker) {
-        // Calculate region to show driver's current location and destination
-        const latitudeDelta = Math.abs(
-          driverLocation.latitude - orderData.marker.latitude
-        ) * 2.2;
-        const longitudeDelta = Math.abs(
-          driverLocation.longitude - orderData.marker.longitude
+          driverLocation.longitude - pickupLocation.longitude
         ) * 2.2;
         
         const newRegion = {
-          latitude: (driverLocation.latitude + orderData.marker.latitude) / 2,
-          longitude: (driverLocation.longitude + orderData.marker.longitude) / 2,
+          latitude: (driverLocation.latitude + pickupLocation.latitude) / 2,
+          longitude: (driverLocation.longitude + pickupLocation.longitude) / 2,
+          latitudeDelta: Math.max(latitudeDelta, 0.0922),
+          longitudeDelta: Math.max(longitudeDelta, 0.0421),
+        };
+        
+        setRegion(newRegion);
+        lastRegionUpdateRef.current = updateKey;
+      } else if (pickupLocation && !regionInitializedRef.current) {
+        // Initial setup: show pickup location if driver location not available yet
+        setRegion({
+          latitude: pickupLocation.latitude,
+          longitude: pickupLocation.longitude,
+          latitudeDelta: 0.0922,
+          longitudeDelta: 0.0421,
+        });
+        regionInitializedRef.current = true;
+        lastRegionUpdateRef.current = updateKey;
+      }
+    } else if (orderStatus === "Ongoing") {
+      // After pickup: Show driver's current location → destination
+      if (driverLocation && destinationLocation) {
+        const latitudeDelta = Math.abs(
+          driverLocation.latitude - destinationLocation.latitude
+        ) * 2.2;
+        const longitudeDelta = Math.abs(
+          driverLocation.longitude - destinationLocation.longitude
+        ) * 2.2;
+        
+        const newRegion = {
+          latitude: (driverLocation.latitude + destinationLocation.latitude) / 2,
+          longitude: (driverLocation.longitude + destinationLocation.longitude) / 2,
           latitudeDelta: Math.max(latitudeDelta, 0.0922),
           longitudeDelta: Math.max(longitudeDelta, 0.0421),
         };
         
         console.log(`[RideDetails] Setting region for Ongoing status (driver to destination):`, newRegion);
         setRegion(newRegion);
-      } else if (orderData?.marker) {
+        lastRegionUpdateRef.current = updateKey;
+      } else if (destinationLocation && !regionInitializedRef.current) {
         // Fallback: just show destination if driver location not available yet
-        console.log(`[RideDetails] Only destination available, showing destination`);
         setRegion({
-          latitude: orderData.marker.latitude,
-          longitude: orderData.marker.longitude,
+          latitude: destinationLocation.latitude,
+          longitude: destinationLocation.longitude,
           latitudeDelta: 0.0922,
           longitudeDelta: 0.0421,
         });
-      } else {
-        console.warn(`[RideDetails] Missing location data for Ongoing status`);
+        regionInitializedRef.current = true;
+        lastRegionUpdateRef.current = updateKey;
       }
     }
-  }, [orderStatus, driverLocation, orderData]); // Run when orderStatus, driverLocation, or orderData changes
+  }, [orderStatus, driverLocation, pickupLocation, destinationLocation]); // Use extracted stable values
 
   const handleSubmit = async () => {
     const accessToken = await AsyncStorage.getItem("accessToken");
+    
+    // Get ride ID - check multiple possible locations
+    // The ride data structure: orderData.rideData.id (from server-created ride)
+    let rideId = orderData?.rideData?.id || 
+                 orderData?.rideData?._id || 
+                 orderData?.ride?.id ||
+                 orderData?.rideData?.rideId; // Fallback
+    
+    console.log(`[RideDetails] Attempting to update ride status. Ride ID check:`, {
+      rideId,
+      hasRideId: !!rideId,
+      isTempId: rideId?.startsWith?.('temp_'),
+      orderDataKeys: Object.keys(orderData || {}),
+      rideDataKeys: orderData?.rideData ? Object.keys(orderData.rideData) : [],
+      rideData: orderData?.rideData,
+    });
+    
+    // If ride ID is a temp ID (starts with "temp_" or "server_created_"), we need to fetch the actual ride from database
+    // This happens when server confirmation didn't include ride data
+    if (rideId && (rideId.startsWith('temp_') || rideId.startsWith('server_created_'))) {
+      console.log(`[RideDetails] Temp ride ID detected (${rideId}), fetching actual ride from database...`);
+      try {
+        const userId = orderData?.user?.id || orderData?.rideData?.userId;
+        const driverId = orderData?.driver?.id || orderData?.rideData?.driverId;
+        
+        console.log(`[RideDetails] Fetching ride with userId: ${userId}, driverId: ${driverId}`);
+        
+        if (!userId || !driverId) {
+          throw new Error("Missing userId or driverId to fetch ride");
+        }
+        
+        // Fetch the actual ride from database
+        const response = await axios.get(
+          `${process.env.EXPO_PUBLIC_SERVER_URI}/driver/get-rides`,
+          {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+            },
+          }
+        );
+        
+        // Find the most recent ride for this user by this driver with Accepted/Processing status
+        const rides = response.data?.rides || response.data || [];
+        console.log(`[RideDetails] Found ${rides.length} rides, searching for matching ride...`);
+        
+        const actualRide = rides.find((ride: any) => {
+          const matchesUser = String(ride.userId) === String(userId);
+          const matchesDriver = String(ride.driverId) === String(driverId);
+          const isActive = ride.status === "Accepted" || ride.status === "Processing" || ride.status === "Ongoing";
+          return matchesUser && matchesDriver && isActive;
+        });
+        
+        if (actualRide && actualRide.id) {
+          rideId = String(actualRide.id);
+          console.log(`[RideDetails] ✅ Found actual ride ID: ${rideId}, status: ${actualRide.status}`);
+          // Update orderData with the actual ride ID
+          if (orderData.rideData) {
+            orderData.rideData.id = rideId;
+          }
+        } else {
+          console.error(`[RideDetails] ❌ Could not find matching ride in database. Rides found:`, rides.map((r: any) => ({
+            id: r.id,
+            userId: r.userId,
+            driverId: r.driverId,
+            status: r.status,
+          })));
+          throw new Error("Could not find ride in database. The ride may not have been created properly.");
+        }
+      } catch (fetchError: any) {
+        console.error(`[RideDetails] Failed to fetch actual ride ID:`, {
+          message: fetchError?.message,
+          response: fetchError?.response?.data,
+          status: fetchError?.response?.status,
+        });
+        Toast.show("Could not find ride. Please try again or contact support.", {
+          type: "danger",
+          placement: "bottom",
+        });
+        return;
+      }
+    }
+    
+    if (!rideId || rideId.startsWith('temp_')) {
+      console.error("[RideDetails] No valid ride ID found:", {
+        rideId,
+        rideData: orderData?.rideData,
+        ride: orderData?.ride,
+        orderDataKeys: Object.keys(orderData || {}),
+      });
+      Toast.show("Ride ID not found. Cannot update status.", {
+        type: "danger",
+        placement: "bottom",
+      });
+      return;
+    }
+    
+    // Determine next status based on current status
+    // "Accepted" or "Processing" -> "Ongoing" (pickup passenger)
+    // "Ongoing" -> "Completed" (drop off passenger)
+    let nextStatus: string;
+    if (orderStatus === "Ongoing") {
+      nextStatus = "Completed";
+    } else {
+      // "Accepted" or "Processing" -> "Ongoing"
+      nextStatus = "Ongoing";
+    }
+    
+    console.log(`[RideDetails] Updating ride status:`, {
+      rideId,
+      currentStatus: orderStatus,
+      nextStatus,
+      hasRideId: !!rideId,
+    });
+    
     await axios
       .put(
         `${process.env.EXPO_PUBLIC_SERVER_URI}/driver/update-ride-status`,
         {
-          rideStatus: orderStatus === "Ongoing" ? "Completed" : "Ongoing",
-          rideId: orderData?.rideData.id,
+          rideStatus: nextStatus,
+          rideId: String(rideId), // Ensure it's a string
         },
         {
           headers: {
@@ -243,50 +326,11 @@ export default function RideDetailsScreen() {
               // Update driver location state
               setDriverLocation(driverCurrentLoc);
               
-              // Update region to show driver's current location and destination
-              if (orderData?.marker) {
-                const latitudeDelta = Math.abs(
-                  driverCurrentLoc.latitude - orderData.marker.latitude
-                ) * 2.2;
-                const longitudeDelta = Math.abs(
-                  driverCurrentLoc.longitude - orderData.marker.longitude
-                ) * 2.2;
-                
-                const newRegion = {
-                  latitude: (driverCurrentLoc.latitude + orderData.marker.latitude) / 2,
-                  longitude: (driverCurrentLoc.longitude + orderData.marker.longitude) / 2,
-                  latitudeDelta: Math.max(latitudeDelta, 0.0922),
-                  longitudeDelta: Math.max(longitudeDelta, 0.0421),
-                };
-                
-                console.log(`[RideDetails] Updating region to show driver location and destination:`, newRegion);
-                setRegion(newRegion);
-              }
+              // Driver location will be updated by the useEffect above, which will update the region
+              // No need to manually update region here
             } catch (error) {
               console.error("[RideDetails] Failed to get driver location for region update:", error);
-              // Fallback: use existing driverLocation or just show destination
-              if (driverLocation && orderData?.marker) {
-                const latitudeDelta = Math.abs(
-                  driverLocation.latitude - orderData.marker.latitude
-                ) * 2.2;
-                const longitudeDelta = Math.abs(
-                  driverLocation.longitude - orderData.marker.longitude
-                ) * 2.2;
-                
-                setRegion({
-                  latitude: (driverLocation.latitude + orderData.marker.latitude) / 2,
-                  longitude: (driverLocation.longitude + orderData.marker.longitude) / 2,
-                  latitudeDelta: Math.max(latitudeDelta, 0.0922),
-                  longitudeDelta: Math.max(longitudeDelta, 0.0421),
-                });
-              } else if (orderData?.marker) {
-                setRegion({
-                  latitude: orderData.marker.latitude,
-                  longitude: orderData.marker.longitude,
-                  latitudeDelta: 0.0922,
-                  longitudeDelta: 0.0421,
-                });
-              }
+              // The useEffect will handle region update when driverLocation state updates
             }
           })();
           
@@ -303,8 +347,16 @@ export default function RideDetailsScreen() {
         }
       })
       .catch((error) => {
-        console.error("[RideDetails] Error updating ride status:", error);
-        Toast.show("Failed to update ride status. Please try again.", {
+        console.error("[RideDetails] Error updating ride status:", {
+          message: error?.message,
+          response: error?.response?.data,
+          status: error?.response?.status,
+          rideId,
+          nextStatus,
+        });
+        
+        const errorMessage = error?.response?.data?.message || error?.message || "Failed to update ride status. Please try again.";
+        Toast.show(errorMessage, {
           type: "danger",
           placement: "bottom",
         });
@@ -320,13 +372,14 @@ export default function RideDetailsScreen() {
           onRegionChangeComplete={(region) => setRegion(region)}
           mapType={mapType}
         >
-          {orderStatus === "Processing" ? (
+          {(orderStatus === "Accepted" || orderStatus === "Processing") ? (
             // Before pickup: Show driver location, pickup location, and route between them
+            // Support both "Accepted" (new) and "Processing" (legacy) for backward compatibility
             <>
               {/* Always show pickup location immediately */}
-              {orderData?.currentLocation && (
+              {pickupLocation && (
                 <Marker
-                  coordinate={orderData.currentLocation}
+                  coordinate={pickupLocation}
                   pinColor="green"
                   title="Pickup Location"
                   description="Passenger pickup point"
@@ -342,10 +395,10 @@ export default function RideDetailsScreen() {
                 />
               )}
               {/* Show route only when both locations are available */}
-              {driverLocation && orderData?.currentLocation && (
+              {driverLocation && pickupLocation && (
                 <MapViewDirections
                   origin={driverLocation}
-                  destination={orderData.currentLocation}
+                  destination={pickupLocation}
                   apikey={process.env.EXPO_PUBLIC_GOOGLE_CLOUD_API_KEY!}
                   strokeWidth={4}
                   strokeColor="blue"
@@ -353,9 +406,9 @@ export default function RideDetailsScreen() {
               )}
             </>
           ) : orderStatus === "Ongoing" ? (
-            // After pickup: Show driver's current location, destination, and route from driver to destination
+            // After pickup: NEW map showing driver's current location, destination, and route from driver to destination
             <>
-              {/* Show driver's current location (updating in real-time) */}
+              {/* Show driver's current location (where they picked up the passenger, updating in real-time) */}
               {driverLocation && (
                 <Marker
                   coordinate={driverLocation}
@@ -364,29 +417,20 @@ export default function RideDetailsScreen() {
                   description="Driver's current location"
                 />
               )}
-              {/* Show pickup location (where passenger was picked up) - optional reference */}
-              {orderData?.currentLocation && (
-                <Marker
-                  coordinate={orderData.currentLocation}
-                  pinColor="green"
-                  title="Pickup Location"
-                  description="Passenger was picked up here"
-                />
-              )}
               {/* Show destination (where to drop off) */}
-              {orderData?.marker && (
+              {destinationLocation && (
                 <Marker
-                  coordinate={orderData.marker}
+                  coordinate={destinationLocation}
                   pinColor="red"
                   title="Destination"
                   description="Drop-off location"
                 />
               )}
               {/* Route from driver's CURRENT location to destination */}
-              {driverLocation && orderData?.marker && (
+              {driverLocation && destinationLocation && (
                 <MapViewDirections
                   origin={driverLocation}
-                  destination={orderData.marker}
+                  destination={destinationLocation}
                   apikey={process.env.EXPO_PUBLIC_GOOGLE_CLOUD_API_KEY!}
                   strokeWidth={4}
                   strokeColor="blue"
@@ -396,16 +440,16 @@ export default function RideDetailsScreen() {
           ) : (
             // Default: Show both (fallback)
             <>
-              {orderData?.marker && (
-                <Marker coordinate={orderData.marker} pinColor="red" title="Destination" />
+              {destinationLocation && (
+                <Marker coordinate={destinationLocation} pinColor="red" title="Destination" />
               )}
-              {orderData?.currentLocation && (
-                <Marker coordinate={orderData.currentLocation} pinColor="green" title="Pickup" />
+              {pickupLocation && (
+                <Marker coordinate={pickupLocation} pinColor="green" title="Pickup" />
               )}
-              {orderData?.currentLocation && orderData?.marker && (
+              {pickupLocation && destinationLocation && (
                 <MapViewDirections
-                  origin={orderData.currentLocation}
-                  destination={orderData.marker}
+                  origin={pickupLocation}
+                  destination={destinationLocation}
                   apikey={process.env.EXPO_PUBLIC_GOOGLE_CLOUD_API_KEY!}
                   strokeWidth={4}
                   strokeColor="blue"
@@ -497,7 +541,7 @@ export default function RideDetailsScreen() {
         <View style={{ paddingTop: windowHeight(30) }}>
           <Button
             title={
-              orderStatus === "Processing"
+              (orderStatus === "Accepted" || orderStatus === "Processing")
                 ? "Pick Up Passenger"
                 : "Drop Off Passenger"
             }

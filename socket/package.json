@@ -11,9 +11,14 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "geolib": "^3.3.4",
     "kill-port": "^2.0.1",
     "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "prisma": "^5.22.0"
   }
 }

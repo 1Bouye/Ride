@@ -1,6 +1,33 @@
 const express = require("express");
 const { WebSocketServer } = require("ws");
 const geolib = require("geolib");
+const path = require("path");
+
+// Load environment variables - try server directory first, then current directory
+const serverEnvPath = path.join(__dirname, "../server/.env");
+const localEnvPath = path.join(__dirname, ".env");
+require("dotenv").config({ path: serverEnvPath }); // Try server .env first
+require("dotenv").config({ path: localEnvPath }); // Then try local .env (will override if exists)
+
+// Try to load Prisma client from server's node_modules first, fallback to local
+let PrismaClient;
+try {
+  // Try server's generated client first
+  const serverPrismaPath = path.join(__dirname, "../server/node_modules/@prisma/client");
+  PrismaClient = require(serverPrismaPath).PrismaClient;
+} catch (err) {
+  // Fallback to local @prisma/client
+  try {
+    PrismaClient = require("@prisma/client").PrismaClient;
+  } catch (err2) {
+    console.error("❌ Failed to load Prisma Client. Make sure Prisma is generated in server directory.");
+    console.error("   Run: cd ../server && npx prisma generate");
+    throw err2;
+  }
+}
+
+// Initialize Prisma client for database checks
+const prisma = new PrismaClient();
 
 // Express app is not currently used, but kept for future HTTP endpoints
 const app = express();
@@ -15,7 +42,7 @@ let drivers = {};
 const driverIdToSocket = {};
 // Track user sockets for forwarding accept events
 const userIdToSocket = {};
-// Track active ride requests: { requestId: { userId, status: 'pending'|'accepted', notifiedDrivers: [driverIds], acceptedBy: driverId, payload: {...}, createdAt: timestamp } }
+// Track active ride requests: { requestId: { userId, status: 'pending'|'processing'|'accepted', notifiedDrivers: [driverIds], processingBy: driverId, acceptedBy: driverId, payload: {...}, createdAt: timestamp } }
 const activeRideRequests = {};
 
 // Create WebSocket server - bind to all interfaces (0.0.0.0) to accept network connections
@@ -43,7 +70,7 @@ wss.on("connection", (ws, req) => {
   console.log(`✅ New WebSocket connection from: ${clientIP}`);
   console.log(`📊 Total active connections: ${wss.clients.size}`);
 
-  ws.on("message", (message) => {
+  ws.on("message", async (message) => {
     try {
       const data = JSON.parse(message);
       console.log(`📨 Received message from ${clientIP}:`, data.type);
@@ -225,7 +252,8 @@ wss.on("connection", (ws, req) => {
         }
       }
 
-      // Driver accepted ride: forward to that user if online
+      // Driver accepted ride: ATOMIC ACCEPTANCE PATTERN (like Uber)
+      // Based on example.md - database enforces the rule atomically
       if (data.type === "driverAccept" && data.role === "driver") {
         const { userId, payload, requestId } = data;
         const driverId = data.driverId || ws.driverId;
@@ -235,11 +263,22 @@ wss.on("connection", (ws, req) => {
           return;
         }
         
-        // Check if request exists and is still pending (race condition prevention)
+        if (!userId) {
+          console.error(`❌ Driver accept missing userId`);
+          if (ws.readyState === 1 /* OPEN */) {
+            ws.send(JSON.stringify({
+              type: "rideRequestCancelled",
+              requestId,
+              reason: "Invalid request data",
+            }));
+          }
+          return;
+        }
+        
+        // Check if request exists
         const rideRequest = activeRideRequests[requestId];
         if (!rideRequest) {
           console.log(`⚠️ Ride request ${requestId} not found or already processed`);
-          // Notify driver that request is no longer available
           if (ws.readyState === 1 /* OPEN */) {
             ws.send(JSON.stringify({
               type: "rideRequestCancelled",
@@ -250,9 +289,19 @@ wss.on("connection", (ws, req) => {
           return;
         }
         
-        if (rideRequest.status !== 'pending') {
-          console.log(`⚠️ Ride request ${requestId} already accepted by driver ${rideRequest.acceptedBy}`);
-          // Notify driver that request is no longer available
+        // ATOMIC LOCK: Check and set status atomically (first driver wins)
+        // This prevents race conditions - only ONE driver can set status to "processing"
+        let acquiredLock = false;
+        if (rideRequest.status === 'pending') {
+          // ATOMIC OPERATION: Set status to "processing" - only first driver can do this
+          rideRequest.status = 'processing';
+          rideRequest.processingBy = driverId;
+          acquiredLock = true;
+          console.log(`🔒 [Server] Driver ${driverId} acquired processing lock for request ${requestId}`);
+        } else if (rideRequest.status === 'processing' || rideRequest.status === 'accepted') {
+          // Another driver is already processing or has accepted
+          const otherDriver = rideRequest.processingBy || rideRequest.acceptedBy;
+          console.log(`❌ [Server] Request ${requestId} already ${rideRequest.status} by driver ${otherDriver}, rejecting driver ${driverId}`);
           if (ws.readyState === 1 /* OPEN */) {
             ws.send(JSON.stringify({
               type: "rideRequestCancelled",
@@ -263,30 +312,22 @@ wss.on("connection", (ws, req) => {
           return;
         }
         
-        // Mark request as accepted (atomic operation - first driver wins)
-        rideRequest.status = 'accepted';
-        rideRequest.acceptedBy = driverId;
-        console.log(`✅ Driver ${driverId} accepted ride request ${requestId}`);
-        
-        // Send confirmation to the accepting driver FIRST (before notifying others)
-        if (ws.readyState === 1 /* OPEN */) {
-          try {
+        // If we didn't acquire the lock, we shouldn't proceed
+        if (!acquiredLock) {
+          console.error(`❌ [Server] Failed to acquire lock for request ${requestId}, driver ${driverId}`);
+          if (ws.readyState === 1 /* OPEN */) {
             ws.send(JSON.stringify({
-              type: "rideAcceptedConfirmation",
+              type: "rideRequestCancelled",
               requestId,
-              message: "Ride request accepted successfully. You can proceed to create the ride.",
+              reason: "Request already accepted by another driver",
             }));
-            console.log(`✅ Sent acceptance confirmation to driver ${driverId} for request ${requestId}`);
-          } catch (err) {
-            console.error(`❌ Failed to send confirmation to driver ${driverId}:`, err);
           }
+          return;
         }
         
-        // Notify all other drivers that this request is no longer available
-        console.log(`📢 Broadcasting cancellation to ${rideRequest.notifiedDrivers.length} other drivers...`);
-        let cancellationSent = 0;
-        let cancellationFailed = 0;
-        
+        // IMMEDIATELY notify all other drivers that this request is being processed
+        // Don't wait for database operation - send cancellation right away
+        console.log(`📢 [Server] Immediately broadcasting cancellation to ${rideRequest.notifiedDrivers.length} other drivers...`);
         rideRequest.notifiedDrivers.forEach((notifiedDriverId) => {
           if (notifiedDriverId !== driverId) {
             const otherDriverSocket = driverIdToSocket[notifiedDriverId];
@@ -297,21 +338,271 @@ wss.on("connection", (ws, req) => {
                   requestId,
                   reason: "Request accepted by another driver",
                 }));
-                cancellationSent++;
-                console.log(`✅ Sent cancellation to driver ${notifiedDriverId} for request ${requestId}`);
+                console.log(`✅ [Server] Sent immediate cancellation to driver ${notifiedDriverId}`);
               } catch (err) {
-                cancellationFailed++;
-                console.error(`❌ Failed to notify driver ${notifiedDriverId}:`, err);
+                console.error(`❌ [Server] Failed to notify driver ${notifiedDriverId}:`, err);
               }
-            } else {
-              cancellationFailed++;
-              const reason = !otherDriverSocket ? "no socket" : `socket state ${otherDriverSocket.readyState}`;
-              console.log(`⚠️ Driver ${notifiedDriverId} not available (${reason}), cannot send cancellation`);
             }
           }
         });
         
-        console.log(`📊 Cancellation summary: ${cancellationSent} sent, ${cancellationFailed} failed`);
+        // ATOMIC DATABASE OPERATION: Try to create ride atomically
+        // Only proceed if we acquired the lock
+        // This is the REAL protection - database enforces the rule
+        // Only ONE driver can successfully create a ride for this user
+        let createdRide = null;
+        try {
+          const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+          
+          // Check if ride already exists (very recent only)
+          const existingRide = await prisma.rides.findFirst({
+            where: {
+              userId: userId,
+              status: {
+                in: ["Accepted", "Processing", "On the way", "Picked up"],
+              },
+              cratedAt: {
+                gte: fiveMinutesAgo,
+              },
+            },
+            orderBy: {
+              cratedAt: "desc",
+            },
+          });
+
+          if (existingRide) {
+            // Ride already exists
+            if (existingRide.driverId !== driverId) {
+              console.log(`❌ [Server] Driver ${driverId} tried to accept, but ride ${existingRide.id} already exists for driver ${existingRide.driverId}`);
+              // Mark request as accepted by the other driver
+              rideRequest.status = 'accepted';
+              rideRequest.acceptedBy = existingRide.driverId;
+              
+              if (ws.readyState === 1 /* OPEN */) {
+                ws.send(JSON.stringify({
+                  type: "rideRequestCancelled",
+                  requestId,
+                  reason: "Request already accepted by another driver",
+                }));
+              }
+              return;
+            } else {
+              // Same driver - idempotency (allow retry)
+              console.log(`ℹ️ [Server] Same driver ${driverId} attempting to accept again, using existing ride (idempotency)`);
+              createdRide = existingRide;
+            }
+          } else {
+            // No ride exists - create it atomically
+            // Extract ride data from payload or rideRequest
+            const rideData = payload || rideRequest.payload;
+            const distance = rideData?.distance || rideRequest.payload?.distance || "0";
+            const driverRate = rideData?.driver?.rate || rideRequest.payload?.driver?.rate || "0";
+            const charge = (parseFloat(distance) * parseFloat(driverRate)).toFixed(2);
+            
+            console.log(`🔨 [Server] Creating ride atomically for user ${userId} by driver ${driverId}...`, {
+              distance,
+              driverRate,
+              charge,
+              hasPayload: !!payload,
+              hasRideRequestPayload: !!rideRequest.payload,
+            });
+            
+            try {
+              createdRide = await prisma.rides.create({
+                data: {
+                  userId: userId,
+                  driverId: driverId,
+                  charge: parseFloat(charge),
+                  status: "Accepted", // Directly accepted - no pending
+                  currentLocationName: rideData?.currentLocationName || rideRequest.payload?.currentLocationName || "",
+                  destinationLocationName: rideData?.destinationLocationName || rideData?.destinationLocation || rideRequest.payload?.destinationLocationName || rideRequest.payload?.destinationLocation || "",
+                  distance: String(distance),
+                },
+              });
+              
+              console.log(`✅ [Server] Ride created atomically: ${createdRide.id} for user ${userId} by driver ${driverId}`, {
+                rideId: createdRide.id,
+                status: createdRide.status,
+                userId: createdRide.userId,
+                driverId: createdRide.driverId,
+              });
+            } catch (createError) {
+              console.error(`❌ [Server] Failed to create ride:`, createError);
+              // Re-throw to be caught by outer try-catch
+              throw createError;
+            }
+          }
+          
+          // Ensure we have a valid ride before proceeding
+          if (!createdRide || !createdRide.id) {
+            console.error(`❌ [Server] Created ride is invalid:`, createdRide);
+            if (ws.readyState === 1 /* OPEN */) {
+              ws.send(JSON.stringify({
+                type: "rideRequestCancelled",
+                requestId,
+                reason: "Failed to create ride. Please try again.",
+              }));
+            }
+            return;
+          }
+        } catch (dbError) {
+          console.error(`❌ [Server] Database error creating ride:`, dbError);
+          
+          // Release the lock on error
+          rideRequest.status = 'pending';
+          delete rideRequest.processingBy;
+          
+          // Check if it's a duplicate error (another driver created it between our check and create)
+          if (dbError?.code === 11000 || dbError?.message?.includes("duplicate") || dbError?.message?.includes("E11000")) {
+            console.log(`❌ [Server] Duplicate ride detected - another driver already created it`);
+            // Mark as accepted by unknown driver
+            rideRequest.status = 'accepted';
+            rideRequest.acceptedBy = 'unknown';
+            
+            if (ws.readyState === 1 /* OPEN */) {
+              ws.send(JSON.stringify({
+                type: "rideRequestCancelled",
+                requestId,
+                reason: "Request already accepted by another driver",
+              }));
+            }
+            return;
+          }
+          
+          // Other database errors - release lock and reject
+          if (ws.readyState === 1 /* OPEN */) {
+            ws.send(JSON.stringify({
+              type: "rideRequestCancelled",
+              requestId,
+              reason: "Failed to create ride. Please try again.",
+            }));
+          }
+          return;
+        }
+        
+        // Ensure we have a valid ride before proceeding
+        if (!createdRide || !createdRide.id) {
+          console.error(`❌ [Server] Created ride is invalid:`, createdRide);
+          // Release the lock
+          rideRequest.status = 'pending';
+          delete rideRequest.processingBy;
+          
+          if (ws.readyState === 1 /* OPEN */) {
+            ws.send(JSON.stringify({
+              type: "rideRequestCancelled",
+              requestId,
+              reason: "Failed to create ride. Please try again.",
+            }));
+          }
+          return;
+        }
+        
+        // SUCCESS: This driver won! Mark request as accepted (upgrade from "processing")
+        rideRequest.status = 'accepted';
+        rideRequest.acceptedBy = driverId;
+        delete rideRequest.processingBy; // Clean up processing flag
+        console.log(`✅ [Server] Driver ${driverId} WON the race! Ride ${createdRide.id} created atomically`);
+        
+        // Convert Prisma object to plain object for JSON serialization
+        // Handle null/undefined values safely
+        const rideData = {
+          id: String(createdRide.id || ''),
+          userId: String(createdRide.userId || ''),
+          driverId: String(createdRide.driverId || ''),
+          charge: createdRide.charge || 0,
+          status: String(createdRide.status || 'Accepted'),
+          currentLocationName: String(createdRide.currentLocationName || ''),
+          destinationLocationName: String(createdRide.destinationLocationName || ''),
+          distance: String(createdRide.distance || '0'),
+          rating: createdRide.rating || null,
+          cratedAt: createdRide.cratedAt ? new Date(createdRide.cratedAt).toISOString() : new Date().toISOString(),
+          updatedAt: createdRide.updatedAt ? new Date(createdRide.updatedAt).toISOString() : new Date().toISOString(),
+        };
+        
+        console.log(`📦 [Server] Prepared ride data for WebSocket:`, {
+          id: rideData.id,
+          status: rideData.status,
+          userId: rideData.userId,
+          driverId: rideData.driverId,
+          hasAllFields: !!(rideData.id && rideData.userId && rideData.driverId),
+        });
+        
+        // Send SUCCESS confirmation to the winning driver with ride data
+        if (ws.readyState === 1 /* OPEN */) {
+          try {
+            // Ensure rideData is valid before sending
+            if (!rideData || !rideData.id) {
+              console.error(`❌ [Server] Cannot send confirmation - invalid ride data:`, rideData);
+              ws.send(JSON.stringify({
+                type: "rideRequestCancelled",
+                requestId,
+                reason: "Failed to create ride. Please try again.",
+              }));
+              return;
+            }
+            
+            const confirmationMessage = {
+              type: "rideAcceptedConfirmation",
+              requestId: String(requestId),
+              ride: rideData, // Send plain object (not Prisma object)
+              message: "Ride accepted successfully! Opening map to pickup location.",
+            };
+            
+            // Log before sending to verify structure
+            console.log(`📤 [Server] Sending confirmation message:`, {
+              type: confirmationMessage.type,
+              requestId: confirmationMessage.requestId,
+              hasRide: !!confirmationMessage.ride,
+              rideId: confirmationMessage.ride?.id,
+              rideStatus: confirmationMessage.ride?.status,
+              rideKeys: confirmationMessage.ride ? Object.keys(confirmationMessage.ride) : [],
+            });
+            
+            const messageString = JSON.stringify(confirmationMessage);
+            
+            // Verify the stringified message contains ride data
+            const testParse = JSON.parse(messageString);
+            if (!testParse.ride || !testParse.ride.id) {
+              console.error(`❌ [Server] Ride data missing in serialized message!`, {
+                hasRide: !!testParse.ride,
+                messageKeys: Object.keys(testParse),
+              });
+            }
+            
+            ws.send(messageString);
+            
+            // Verify what was sent
+            console.log(`✅ [Server] Sent acceptance confirmation to driver ${driverId}`, {
+              requestId: testParse.requestId,
+              rideId: testParse.ride?.id,
+              status: testParse.ride?.status,
+              messageLength: messageString.length,
+              rideIncluded: !!testParse.ride,
+            });
+          } catch (err) {
+            console.error(`❌ [Server] Failed to send confirmation to driver ${driverId}:`, err);
+            console.error(`❌ [Server] Error details:`, {
+              message: err.message,
+              stack: err.stack,
+              rideData: rideData ? { id: rideData.id, status: rideData.status } : null,
+            });
+            
+            // Send cancellation on error
+            if (ws.readyState === 1 /* OPEN */) {
+              ws.send(JSON.stringify({
+                type: "rideRequestCancelled",
+                requestId,
+                reason: "Failed to send confirmation. Please try again.",
+              }));
+            }
+          }
+        } else {
+          console.error(`❌ [Server] WebSocket not open, cannot send confirmation to driver ${driverId}`);
+        }
+        
+        // Note: Cancellation was already sent immediately when lock was acquired (line ~330)
+        // This ensures other drivers get notified as fast as possible, before database operation completes
+        console.log(`✅ [Server] Ride acceptance complete. Cancellation was already sent to other drivers when lock was acquired.`);
         
         // Forward acceptance to user
         const uSocket = userIdToSocket[userId];

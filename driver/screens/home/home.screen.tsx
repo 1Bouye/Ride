@@ -69,10 +69,14 @@ export default function HomeScreen() {
   const [isRequestCancelled, setIsRequestCancelled] = useState(false);
   // Track if we're waiting for server confirmation
   const [waitingForConfirmation, setWaitingForConfirmation] = useState(false);
+  // Countdown timer for ride request (10 seconds)
+  const [countdownTimer, setCountdownTimer] = useState(10);
+  const countdownTimerRef = useRef<NodeJS.Timeout | null>(null);
   // Store the accept promise resolver
   const acceptConfirmationRef = useRef<{
     resolve: (value: boolean) => void;
     reject: (error: any) => void;
+    ride?: any; // Store ride data from server
   } | null>(null);
 
   // Get WebSocket URL - handle Android emulator and physical device
@@ -342,6 +346,7 @@ export default function HomeScreen() {
             // Store request ID and reset cancellation state
             setCurrentRequestId(requestId);
             setIsRequestCancelled(false); // Reset cancellation state for new request
+            setCountdownTimer(10); // Reset countdown to 10 seconds
             
             setIsModalVisible(true);
             // Store user's pickup location separately
@@ -377,14 +382,43 @@ export default function HomeScreen() {
           // Handle ride acceptance confirmation from server
           if (message?.type === "rideAcceptedConfirmation") {
             const confirmedRequestId = message.requestId;
-            console.log(`✅ Received acceptance confirmation for request ${confirmedRequestId}`);
+            const rideData = message?.ride; // Ride data created by server atomically
+            console.log(`✅ Received acceptance confirmation for request ${confirmedRequestId}`, {
+              rideId: rideData?.id,
+              status: rideData?.status,
+              hasRideData: !!rideData,
+              messageKeys: Object.keys(message || {}),
+              rideDataKeys: rideData ? Object.keys(rideData) : [],
+            });
             
-            // If we're waiting for confirmation, resolve the promise
+            // If we're waiting for confirmation, resolve the promise with ride data
             if (acceptConfirmationRef.current && confirmedRequestId === currentRequestId) {
-              console.log(`✅ Confirmation matches current request, proceeding to create ride`);
-              acceptConfirmationRef.current.resolve(true);
-              acceptConfirmationRef.current = null;
+              console.log(`✅ Confirmation matches current request, storing ride data and resolving IMMEDIATELY`, {
+                hasRideData: !!rideData,
+                rideId: rideData?.id,
+              });
+              // Store ride data from server (already created atomically)
+              if (acceptConfirmationRef.current) {
+                if (rideData) {
+                  acceptConfirmationRef.current.ride = rideData; // Store ride data
+                  console.log(`📦 Stored ride data in ref:`, {
+                    id: rideData.id,
+                    status: rideData.status,
+                  });
+                } else {
+                  console.warn(`⚠️ No ride data in confirmation message, but server confirmed - ride was created on server`);
+                }
+                // Resolve promise immediately - this will trigger navigation
+                acceptConfirmationRef.current.resolve(true);
+                // Keep ref alive briefly - acceptRideHandler will clear it after retrieving ride data
+              }
               setWaitingForConfirmation(false);
+            } else {
+              console.log(`⚠️ Confirmation received but not waiting for it or request ID mismatch`, {
+                hasRef: !!acceptConfirmationRef.current,
+                confirmedRequestId,
+                currentRequestId,
+              });
             }
           }
           
@@ -405,11 +439,17 @@ export default function HomeScreen() {
             // Close modal if this is the current request OR if modal is open (safety check)
             if (cancelledRequestId === currentRequestId || (isModalVisible && currentRequestId)) {
               console.log(`🚫 Closing modal for cancelled request ${cancelledRequestId}`);
+              // Clear countdown timer
+              if (countdownTimerRef.current) {
+                clearInterval(countdownTimerRef.current);
+                countdownTimerRef.current = null;
+              }
               setIsRequestCancelled(true);
               setIsModalVisible(false);
               setCurrentRequestId(null);
               setUserData(null);
               setUserPickupLocation(null); // Clear user pickup location
+              setCountdownTimer(10); // Reset countdown
               Toast.show("This ride request was accepted by another driver.", {
                 type: "info",
                 placement: "bottom",
@@ -417,11 +457,17 @@ export default function HomeScreen() {
             } else if (isModalVisible) {
               // If modal is open but requestId doesn't match, close it anyway (safety)
               console.log(`🚫 Modal is open but requestId mismatch, closing anyway`);
+              // Clear countdown timer
+              if (countdownTimerRef.current) {
+                clearInterval(countdownTimerRef.current);
+                countdownTimerRef.current = null;
+              }
               setIsRequestCancelled(true);
               setIsModalVisible(false);
               setCurrentRequestId(null);
               setUserData(null);
               setUserPickupLocation(null); // Clear user pickup location
+              setCountdownTimer(10); // Reset countdown
             }
           }
         } catch (error) {
@@ -638,7 +684,53 @@ export default function HomeScreen() {
       }
       console.log('[Driver] Location update interval stopped');
     };
-  }, [isOn, currentLocation, driver?.accountStatus]);
+  }, [isOn, driver?.accountStatus]); // Removed currentLocation - we don't need to restart interval when location changes
+
+  // Countdown timer for ride request popup (10 seconds)
+  useEffect(() => {
+    // Clear any existing timer first
+    if (countdownTimerRef.current) {
+      clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+
+    // Only start countdown if modal is visible and request is not cancelled
+    if (isModalVisible && !isRequestCancelled && currentRequestId) {
+      console.log(`⏰ Starting 10-second countdown timer for request ${currentRequestId}`);
+      
+      // Start countdown
+      countdownTimerRef.current = setInterval(() => {
+        setCountdownTimer((prev) => {
+          if (prev <= 1) {
+            // Timer reached 0, close modal
+            console.log(`⏰ Countdown expired, closing modal for request ${currentRequestId}`);
+            if (countdownTimerRef.current) {
+              clearInterval(countdownTimerRef.current);
+              countdownTimerRef.current = null;
+            }
+            setIsModalVisible(false);
+            setCurrentRequestId(null);
+            setUserData(null);
+            setUserPickupLocation(null);
+            Toast.show("Ride request expired. The request timed out.", {
+              type: "info",
+              placement: "bottom",
+            });
+            return 10; // Reset to 10 for next request
+          }
+          return prev - 1;
+        });
+      }, 1000); // Update every second
+    }
+
+    // Cleanup on unmount or when modal closes
+    return () => {
+      if (countdownTimerRef.current) {
+        clearInterval(countdownTimerRef.current);
+        countdownTimerRef.current = null;
+      }
+    };
+  }, [isModalVisible, isRequestCancelled, currentRequestId]);
 
   useEffect(() => {
     (async () => {
@@ -794,6 +886,11 @@ export default function HomeScreen() {
 
 
   const handleClose = () => {
+    // Clear countdown timer
+    if (countdownTimerRef.current) {
+      clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
     // If we're waiting for confirmation, cancel the promise
     if (acceptConfirmationRef.current) {
       acceptConfirmationRef.current.reject(new Error("User cancelled"));
@@ -805,6 +902,7 @@ export default function HomeScreen() {
     setUserData(null);
     setUserPickupLocation(null); // Clear user pickup location
     setIsRequestCancelled(false); // Reset cancellation state when closing
+    setCountdownTimer(10); // Reset countdown
   };
 
   // Refresh driver data (wallet balance, earnings, etc.)
@@ -917,6 +1015,12 @@ export default function HomeScreen() {
       return;
     }
     
+    // Clear countdown timer when accepting
+    if (countdownTimerRef.current) {
+      clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+    
     // Check if request has been cancelled
     if (isRequestCancelled) {
       console.log("[Driver] Request has been cancelled, cannot accept");
@@ -936,6 +1040,12 @@ export default function HomeScreen() {
       return;
     }
     
+    // Clear countdown timer when accepting
+    if (countdownTimerRef.current) {
+      clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+
     try {
       setAccepting(true);
       console.log(`[Driver] Accept button pressed for request ${currentRequestId}`);
@@ -964,85 +1074,237 @@ export default function HomeScreen() {
         }
       }
       
-      // Notify the server via WS that the driver accepted (with requestId for race condition handling)
-      // Send immediately and proceed optimistically - server will handle race conditions
-      try {
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          // Send acceptance to server (non-blocking)
-          wsRef.current.send(
-            JSON.stringify({
-              type: "driverAccept",
-              role: "driver",
-              driverId: driverId,
-              userId: userData.id,
-              requestId: currentRequestId,
-              payload: {
-                user: userData,
-                currentLocation,
-                marker,
-                distance,
-                currentLocationName,
-                destinationLocation: destinationLocationName,
-                driver,
-              },
-            })
-          );
-          console.log(`📣 Sent driverAccept via WS for request ${currentRequestId}`);
-        } else {
-          console.log("⚠️ WS not open; proceeding anyway (will handle error if server rejects)");
-        }
-      } catch (err: any) {
-        console.log("⚠️ Error sending driverAccept via WS:", err);
-        // Continue anyway - database will handle duplicates
-      }
-      
-      // Create the ride in the database immediately (optimistic update)
-      // Database will prevent duplicates if another driver already accepted
-      const res = await axios.post(
-        `${process.env.EXPO_PUBLIC_SERVER_URI}/driver/new-ride`,
-        {
-          userId: userData.id,
-          charge: (distance * parseInt(driver?.rate!)).toFixed(2),
-          status: "Processing",
-          currentLocationName,
-          destinationLocationName,
-          distance,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-          },
-        }
-      );
-      
-      console.log(`✅ Ride created in database: ${res.data.newRide?.id}`);
-
-      const data = {
-        ...driver,
-        currentLocation,
-        marker,
-        distance,
-      };
-      const driverPushToken = "ExponentPushToken[A22bNzKGUMegAXVEqzDnUx]";
-      await sendPushNotification(driverPushToken, data);
-
-      // Clear request ID and navigate
-      setCurrentRequestId(null);
-      setIsModalVisible(false);
-
-      // Check if the response indicates the ride was already accepted
-      if (res.data?.message?.includes("already accepted")) {
-        setIsRequestCancelled(true);
-        setIsModalVisible(false);
-        setCurrentRequestId(null);
-        setUserData(null);
-        Toast.show("This ride was already accepted by another driver.", {
-          type: "info",
+      // Notify the server via WS that the driver accepted
+      // Server will check database and only allow if no ride exists for this user
+      // Wait for server confirmation before creating ride in database
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        console.log("❌ WebSocket not open, cannot accept ride");
+        Toast.show("Connection error. Please try again.", {
+          type: "danger",
           placement: "bottom",
         });
         setAccepting(false);
         return;
       }
+
+      // Send acceptance to server and wait for confirmation
+      wsRef.current.send(
+        JSON.stringify({
+          type: "driverAccept",
+          role: "driver",
+          driverId: driverId,
+          userId: userData.id,
+          requestId: currentRequestId,
+          payload: {
+            user: userData,
+            currentLocation,
+            marker,
+            distance,
+            currentLocationName,
+            destinationLocationName: destinationLocationName, // Use correct field name
+            destinationLocation: destinationLocationName, // Also include for backward compatibility
+            driver: {
+              ...driver,
+              rate: driver?.rate, // Ensure rate is included
+            },
+          },
+        })
+      );
+      console.log(`📣 Sent driverAccept via WS for request ${currentRequestId}, waiting for server confirmation...`);
+      
+      // Wait for server confirmation (with timeout) - server creates ride atomically
+      let serverConfirmed = false;
+      let storedRideData = null; // Store ride data separately
+      let confirmationReceived = false; // Track if we received confirmation
+      const confirmationPromise = new Promise<boolean>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          if (!confirmationReceived) {
+            console.log(`⏰ Server confirmation timeout after 5 seconds`);
+            resolve(false); // Timeout - no confirmation received
+          }
+        }, 5000); // 5 second timeout (increased from 3)
+
+        // Store the promise resolver
+        acceptConfirmationRef.current = {
+          resolve: (value: boolean) => {
+            clearTimeout(timeout);
+            confirmationReceived = true;
+            serverConfirmed = true;
+            // Store ride data from ref before resolving
+            storedRideData = acceptConfirmationRef.current?.ride || null;
+            console.log(`✅ Promise resolved, stored ride data:`, {
+              hasRideData: !!storedRideData,
+              rideId: storedRideData?.id,
+              serverConfirmed: true,
+            });
+            resolve(value);
+          },
+          reject: (error: any) => {
+            clearTimeout(timeout);
+            // If it's a cancellation, reject immediately
+            if (error?.message?.includes("already accepted") || error?.message?.includes("cancelled")) {
+              reject(error);
+            } else {
+              // For other errors, proceed optimistically
+              console.log(`⚠️ Server confirmation error, proceeding anyway:`, error);
+              resolve(false);
+            }
+          },
+          ride: null, // Initialize ride property
+        };
+      });
+
+      // Wait for server confirmation - server creates ride atomically
+      let wasCancelled = false;
+      try {
+        // Wait for server confirmation (but don't block if it times out)
+        await confirmationPromise;
+        console.log(`📡 [Driver] Confirmation promise resolved, serverConfirmed: ${serverConfirmed}, hasStoredRideData: ${!!storedRideData}`);
+      } catch (error: any) {
+        // Only handle cancellation errors - these mean ride was NOT created
+        if (error?.message?.includes("already accepted") || error?.message?.includes("cancelled")) {
+          console.error(`❌ Request was cancelled by server:`, error);
+          wasCancelled = true;
+          setAccepting(false);
+          setIsModalVisible(false);
+          setCurrentRequestId(null);
+          setUserData(null);
+          // Clear ref on cancellation
+          acceptConfirmationRef.current = null;
+          Toast.show("This ride request was already accepted by another driver.", {
+            type: "info",
+            placement: "bottom",
+          });
+          return;
+        }
+        // For other errors, proceed anyway (might be network delay)
+        console.log(`⚠️ Server confirmation issue, proceeding optimistically:`, error);
+      }
+      
+      // If we received explicit cancellation, don't proceed
+      if (wasCancelled) {
+        return;
+      }
+      
+      // Retrieve ride data - try storedRideData first, then ref as fallback
+      let serverRideData = storedRideData;
+      if (!serverRideData && acceptConfirmationRef.current?.ride) {
+        serverRideData = acceptConfirmationRef.current.ride;
+        console.log(`📦 Retrieved ride data from ref fallback:`, {
+          rideId: serverRideData?.id,
+          status: serverRideData?.status,
+        });
+      }
+      
+      // Clear confirmation ref AFTER retrieving ride data
+      acceptConfirmationRef.current = null;
+      
+      // DECISION LOGIC: Only fail if we're CERTAIN the ride wasn't created
+      // If server confirmed OR we have ride data OR no cancellation was received → proceed
+      // Only fail if: no confirmation AND no ride data AND we're sure it failed
+      if (!serverConfirmed && !serverRideData) {
+        // Check if we received a cancellation message (would have been caught above)
+        // If we got here without cancellation, might be network delay - proceed optimistically
+        console.log(`⚠️ [Driver] No confirmation and no ride data, but no cancellation either - proceeding optimistically (ride might have been created)`);
+        // Don't fail - proceed with minimal ride object
+      }
+      
+      // If server confirmed, the ride was created on server even if we don't have the data
+      // IMPORTANT: If server confirmed but we don't have ride data, we MUST fetch it from database
+      // Don't use temp IDs - they won't work for status updates
+      let rideData = serverRideData;
+      
+      if (!rideData && serverConfirmed) {
+        // Server confirmed but no ride data - fetch it from database
+        console.log(`⚠️ [Driver] Server confirmed but no ride data - fetching from database...`);
+        try {
+          const response = await axios.get(
+            `${process.env.EXPO_PUBLIC_SERVER_URI}/driver/get-rides`,
+            {
+              headers: {
+                Authorization: `Bearer ${accessToken}`,
+              },
+            }
+          );
+          
+          const rides = response.data?.rides || response.data || [];
+          const actualRide = rides.find((ride: any) => 
+            String(ride.userId) === String(userData.id) && 
+            String(ride.driverId) === String(driverId) && 
+            (ride.status === "Accepted" || ride.status === "Processing")
+          );
+          
+          if (actualRide && actualRide.id) {
+            rideData = {
+              id: String(actualRide.id),
+              userId: String(actualRide.userId),
+              driverId: String(actualRide.driverId),
+              status: actualRide.status || "Accepted",
+              charge: actualRide.charge,
+              currentLocationName: actualRide.currentLocationName,
+              destinationLocationName: actualRide.destinationLocationName,
+              distance: actualRide.distance,
+            };
+            console.log(`✅ [Driver] Fetched actual ride from database: ${rideData.id}`);
+          } else {
+            console.error(`❌ [Driver] Could not find ride in database after server confirmation`);
+            // Still proceed but with temp ID - will be fixed in ride-details screen
+            rideData = { 
+              id: `temp_${Date.now()}`, 
+              status: "Accepted",
+              userId: userData.id,
+              driverId: driverId,
+            };
+          }
+        } catch (fetchError) {
+          console.error(`❌ [Driver] Failed to fetch ride from database:`, fetchError);
+          // Still proceed but with temp ID - will be fixed in ride-details screen
+          rideData = { 
+            id: `temp_${Date.now()}`, 
+            status: "Accepted",
+            userId: userData.id,
+            driverId: driverId,
+          };
+        }
+      } else if (!rideData) {
+        // No server confirmation and no ride data - use temp ID (will be fixed in ride-details)
+        rideData = { 
+          id: `temp_${Date.now()}`, 
+          status: "Accepted",
+          userId: userData.id,
+          driverId: driverId,
+        };
+      }
+      
+      console.log(`📝 [Driver] Final ride data to use - PROCEEDING TO NAVIGATION:`, {
+        rideId: rideData.id,
+        status: rideData.status,
+        hasValidRide: !!rideData.id,
+        serverConfirmed,
+        hasServerRideData: !!serverRideData,
+        willProceed: true,
+        reason: serverConfirmed ? 'Server confirmed' : serverRideData ? 'Has ride data' : 'Optimistic (no cancellation)',
+      });
+
+      // Try to send push notification (non-blocking - don't prevent navigation)
+      try {
+        const data = {
+          ...driver,
+          currentLocation,
+          marker,
+          distance,
+        };
+        const driverPushToken = "ExponentPushToken[A22bNzKGUMegAXVEqzDnUx]";
+        await sendPushNotification(driverPushToken, data);
+      } catch (pushError) {
+        console.log(`⚠️ Failed to send push notification, but continuing:`, pushError);
+        // Don't block navigation for push notification errors
+      }
+
+      // Clear request ID and modal BEFORE navigation
+      setCurrentRequestId(null);
+      setIsModalVisible(false);
+      setAccepting(false); // Reset accepting state immediately
 
       // Prepare ride data for navigation
       // Use the stored user pickup location (from the ride request)
@@ -1065,32 +1327,39 @@ export default function HomeScreen() {
         return;
       }
       
-      // Get driver's current location to pass to ride-details (avoid delay)
-      let driverCurrentLoc = null;
+      // Get driver's current location quickly (with timeout to not block navigation)
+      let driverCurrentLoc = lastLocation; // Use last known location as fallback
       try {
-        const driverLoc = await GeoLocation.getCurrentPositionAsync({
+        // Try to get fresh location, but don't wait too long
+        const locationPromise = GeoLocation.getCurrentPositionAsync({
           accuracy: GeoLocation.Accuracy.Balanced,
         });
+        const timeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error("Location timeout")), 2000)
+        );
+        
+        const driverLoc = await Promise.race([locationPromise, timeoutPromise]) as any;
         driverCurrentLoc = {
           latitude: driverLoc.coords.latitude,
           longitude: driverLoc.coords.longitude,
         };
-        console.log(`[Driver] Got driver location for navigation:`, driverCurrentLoc);
+        console.log(`[Driver] Got fresh driver location for navigation:`, driverCurrentLoc);
       } catch (err) {
-        console.log(`[Driver] Could not get driver location, will fetch on ride-details screen`);
-        // Use last known location if available
-        if (lastLocation) {
-          driverCurrentLoc = lastLocation;
-        }
+        console.log(`[Driver] Using last known location or will fetch on ride-details screen`);
+        // Use last known location if available, otherwise ride-details will fetch it
       }
       
-      const rideData = {
+      // Prepare ride data - use ride from server (already created atomically)
+      const rideDataForNavigation = {
         user: userData,
         currentLocation: pickupLoc, // User's pickup location
         marker: marker, // Destination
         driver,
         distance,
-        rideData: res.data.newRide,
+        rideData: {
+          ...rideData, // Use ride data from server (already created atomically)
+          status: "Accepted", // Ensure status is "Accepted" for immediate pickup view
+        },
         // Also include location names for display
         currentLocationName: currentLocationName,
         destinationLocationName: destinationLocationName,
@@ -1098,16 +1367,24 @@ export default function HomeScreen() {
         driverLocation: driverCurrentLoc,
       };
       
-      console.log(`[Driver] Navigating to ride-details with data:`, {
+      console.log(`✅ [Driver] Ride accepted! Navigating to pickup map...`, {
         pickup: pickupLoc,
         destination: marker,
         driverLocation: driverCurrentLoc,
-        rideId: res.data.newRide?.id,
+        rideId: rideData.id,
+        status: "Accepted",
       });
       
+      // Navigate IMMEDIATELY - don't wait for anything else
       router.push({
         pathname: "/(routes)/ride-details",
-        params: { orderData: JSON.stringify(rideData) },
+        params: { orderData: JSON.stringify(rideDataForNavigation) },
+      });
+      
+      // Show success message
+      Toast.show("Ride accepted! Navigate to pickup location.", {
+        type: "success",
+        placement: "bottom",
       });
     } catch (error: any) {
       console.log("[Driver] Accept error:", error?.message || error);
@@ -1274,6 +1551,37 @@ export default function HomeScreen() {
                 }}>
                   This request was already accepted by another driver.
                 </Text>
+              )}
+              {!isRequestCancelled && isModalVisible && (
+                <View style={{
+                  alignItems: 'center',
+                  marginTop: 10,
+                  marginBottom: 5,
+                }}>
+                  <Text style={{
+                    fontSize: 16,
+                    fontWeight: '600',
+                    color: countdownTimer <= 3 ? '#ef4444' : '#3b82f6',
+                  }}>
+                    {countdownTimer} seconds remaining
+                  </Text>
+                  {/* Visual countdown bar */}
+                  <View style={{
+                    width: '80%',
+                    height: 4,
+                    backgroundColor: '#e5e7eb',
+                    borderRadius: 2,
+                    marginTop: 8,
+                    overflow: 'hidden',
+                  }}>
+                    <View style={{
+                      width: `${(countdownTimer / 10) * 100}%`,
+                      height: '100%',
+                      backgroundColor: countdownTimer <= 3 ? '#ef4444' : '#3b82f6',
+                      borderRadius: 2,
+                    }} />
+                  </View>
+                </View>
               )}
               {region ? (
                 <MapView
