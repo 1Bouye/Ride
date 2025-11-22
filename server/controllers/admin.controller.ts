@@ -9,6 +9,18 @@ const sanitizeDriver = (driver: any) => {
   return rest;
 };
 
+/**
+ * Truncates a money amount by dropping all decimal places (no rounding)
+ * Examples:
+ * - 250.5 → 250
+ * - 250.9 → 250
+ * - 251.3 → 251
+ * - 25.1 → 25
+ */
+const truncateDecimal = (value: number): number => {
+  return Math.floor(value); // Drops all decimals, keeps integer part only
+};
+
 const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET!;
 
 export const adminLogin = async (req: Request, res: Response) => {
@@ -231,13 +243,16 @@ export const updateDriverWalletBalance = async (req: Request, res: Response) => 
     }
 
     const balanceBefore = ((driver as any).walletBalance as number) || 0;
-    const amountAdded = walletBalance - balanceBefore;
+    
+    // Truncate wallet balance (drop all decimals)
+    const truncatedWalletBalance = truncateDecimal(walletBalance);
+    const amountAdded = truncatedWalletBalance - balanceBefore;
 
     // Update driver wallet balance
     const updatedDriver = await prisma.driver.update({
       where: { id: driverId },
       data: {
-        walletBalance: walletBalance as any,
+        walletBalance: truncatedWalletBalance as any,
       } as any,
     });
 
@@ -253,7 +268,7 @@ export const updateDriverWalletBalance = async (req: Request, res: Response) => 
             adminId,
             amount: amountAdded,
             balanceBefore,
-            balanceAfter: walletBalance,
+            balanceAfter: truncatedWalletBalance,
           },
         });
         console.log(`[Admin] Transaction recorded: ${amountAdded} MRU added to driver ${driverId}`);
@@ -333,6 +348,67 @@ export const getDriverWalletHistory = async (req: Request, res: Response) => {
     return res.status(500).json({
       success: false,
       message: "Failed to fetch wallet transaction history.",
+      error: error instanceof Error ? error.message : "Unknown error",
+    });
+  }
+};
+
+// Get driver ride history for admin
+export const getDriverRides = async (req: Request, res: Response) => {
+  try {
+    const { driverId } = req.params;
+
+    const rides = await prisma.rides.findMany({
+      where: {
+        driverId: driverId,
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            phone_number: true,
+          },
+        },
+      },
+      orderBy: {
+        cratedAt: "desc",
+      },
+    });
+
+    // Calculate commission and net amount for each completed ride
+    const ridesWithDetails = rides.map((ride) => {
+      const tripCost = Math.floor(ride.charge); // Truncate (drop decimals)
+      const commission = Math.floor(ride.charge * 0.1); // 10% commission, truncated
+      const netAmount = tripCost - commission; // What driver actually received
+
+      return {
+        id: ride.id,
+        userId: ride.userId,
+        driverId: ride.driverId,
+        charge: tripCost,
+        commission: commission,
+        netAmount: netAmount,
+        status: ride.status,
+        currentLocationName: ride.currentLocationName,
+        destinationLocationName: ride.destinationLocationName,
+        distance: ride.distance,
+        rating: ride.rating,
+        cratedAt: ride.cratedAt,
+        updatedAt: ride.updatedAt,
+        user: ride.user,
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      rides: ridesWithDetails,
+    });
+  } catch (error: any) {
+    console.error("[Admin] Error fetching driver rides:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch driver ride history.",
       error: error instanceof Error ? error.message : "Unknown error",
     });
   }

@@ -97,45 +97,114 @@ export default function DocumentVerificationScreen() {
 
     setLoading(true);
     try {
-      const { password: _, ...payloadWithoutPassword } = payload;
-      console.log(
-        "[DocumentVerification] Submitting driver application",
-        JSON.stringify(payloadWithoutPassword)
-      );
-      await axios.post(`${apiBaseUrl}/driver/register`, payload);
-      console.log(
-        "[DocumentVerification] Submission succeeded, showing success message"
-      );
+      // Ensure API URL has the correct path
+      let finalApiUrl = apiBaseUrl;
+      if (!finalApiUrl.endsWith('/api/v1')) {
+        // Remove trailing slash if present
+        finalApiUrl = finalApiUrl.replace(/\/$/, '');
+        // Add /api/v1 if not present
+        if (!finalApiUrl.endsWith('/api/v1')) {
+          finalApiUrl = `${finalApiUrl}/api/v1`;
+        }
+      }
       
-      // Show popup alert with success message
-      Alert.alert(
-        "Application Submitted",
-        "Your information has been submitted for further verification. Please wait for a call or message on WhatsApp.",
-        [
-          {
-            text: "OK",
-            onPress: () => {
-              // Navigate to login screen after clicking OK
-              router.replace({
-                pathname: "/(routes)/login",
-                params: { submitted: "true", phone: payload.phone_number },
-              });
+      // First, test connectivity with a simple health check
+      const healthEndpoint = `${finalApiUrl}/driver/health`;
+      console.log("[DocumentVerification] Testing server connectivity:", healthEndpoint);
+      
+      try {
+        const healthResponse = await axios.get(healthEndpoint, { timeout: 5000 });
+        console.log("[DocumentVerification] ✅ Server is reachable:", healthResponse.data);
+      } catch (healthError: any) {
+        console.warn("[DocumentVerification] ⚠️ Health check failed, but continuing:", healthError?.message);
+        // Continue anyway - might be a CORS issue with GET request
+      }
+      
+      const endpoint = `${finalApiUrl}/driver/register`;
+      console.log("[DocumentVerification] Submitting driver application to:", endpoint);
+      console.log("[DocumentVerification] Payload (without password):", {
+        name: payload.name,
+        country: payload.country,
+        phone_number: payload.phone_number,
+        email: payload.email || "(not provided)",
+        vehicle_type: payload.vehicle_type,
+        registration_number: payload.registration_number,
+        registration_date: payload.registration_date,
+        driving_license: payload.driving_license,
+        vehicle_color: payload.vehicle_color,
+        rate: payload.rate,
+      });
+      
+      const response = await axios.post(endpoint, payload, {
+        timeout: 30000, // 30 second timeout
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+      
+      console.log("[DocumentVerification] Response:", {
+        status: response.status,
+        success: response.data?.success,
+        message: response.data?.message,
+      });
+      
+      if (response.data?.success) {
+        console.log("[DocumentVerification] Submission succeeded, showing success message");
+        
+        // Show popup alert with success message
+        Alert.alert(
+          "Application Submitted",
+          "Your information has been submitted for further verification. Please wait for a call or message on WhatsApp.",
+          [
+            {
+              text: "OK",
+              onPress: () => {
+                // Navigate to login screen after clicking OK
+                router.replace({
+                  pathname: "/(routes)/login",
+                  params: { submitted: "true", phone: payload.phone_number },
+                });
+              },
             },
-          },
-        ],
-        { cancelable: false }
-      );
+          ],
+          { cancelable: false }
+        );
+      } else {
+        throw new Error(response.data?.message || "Submission failed");
+      }
     } catch (error: any) {
-      console.log(
-        "[DocumentVerification] Submission failed",
-        error?.response?.data ?? error?.message ?? error
-      );
-      const message =
-        error?.response?.data?.message ??
-        "Unable to submit application. Please try again.";
-      Toast.show(message, {
+      console.error("[DocumentVerification] Submission failed:", error);
+      console.error("[DocumentVerification] Error details:", {
+        message: error?.message,
+        response: error?.response?.data,
+        status: error?.response?.status,
+        code: error?.code,
+        config: error?.config ? {
+          url: error.config.url,
+          method: error.config.method,
+        } : null,
+      });
+      
+      let errorMessage = "Unable to submit application. Please try again.";
+      
+      if (error?.response?.data?.message) {
+        errorMessage = error.response.data.message;
+      } else if (error?.message) {
+        if (error.message.includes('timeout') || error.code === 'ECONNABORTED') {
+          errorMessage = "Connection timeout. Please check your internet connection and try again.";
+        } else if (error.message.includes('Network Error') || error.code === 'ERR_NETWORK') {
+          errorMessage = "Network error. Please check your internet connection and ensure the server is running.";
+        } else if (error.code === 'ECONNREFUSED') {
+          errorMessage = "Cannot connect to server. Please check if the server is running.";
+        } else {
+          errorMessage = error.message;
+        }
+      }
+      
+      Toast.show(errorMessage, {
         placement: "bottom",
         type: "danger",
+        duration: 5000,
       });
     } finally {
       setLoading(false);

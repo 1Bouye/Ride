@@ -30,6 +30,9 @@ export function DriverReviewCard({
   const [walletHistory, setWalletHistory] = useState<any[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [rideHistory, setRideHistory] = useState<any[]>([]);
+  const [isLoadingRideHistory, setIsLoadingRideHistory] = useState(false);
+  const [showRideHistory, setShowRideHistory] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteConfirmName, setDeleteConfirmName] = useState("");
   const submittedDate = new Date(driver.submittedAt).toLocaleString();
@@ -138,12 +141,41 @@ export function DriverReviewCard({
     setShowHistory(!showHistory);
   };
 
+  const loadRideHistory = async () => {
+    if (!token || !showRideHistory) return;
+    
+    setIsLoadingRideHistory(true);
+    try {
+      const response = await apiRequest<{ success: boolean; rides: any[] }>({
+        endpoint: `/admin/drivers/${driver.id}/rides`,
+        token,
+      });
+      setRideHistory(response.rides || []);
+    } catch (error: any) {
+      console.error("Failed to load ride history:", error);
+      setRideHistory([]);
+    } finally {
+      setIsLoadingRideHistory(false);
+    }
+  };
+
+  const handleToggleRideHistory = () => {
+    setShowRideHistory(!showRideHistory);
+  };
+
   useEffect(() => {
     if (showHistory && driver.accountStatus === "approved" && token) {
       loadWalletHistory();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showHistory, driver.id, driver.accountStatus]);
+
+  useEffect(() => {
+    if (showRideHistory && driver.accountStatus === "approved" && token) {
+      loadRideHistory();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showRideHistory, driver.id, driver.accountStatus]);
 
   const handleSendWallet = async () => {
     if (!walletAmount.trim()) {
@@ -320,7 +352,7 @@ export function DriverReviewCard({
         {driver.accountStatus === "approved" && (
           <div>
             <dt>Current Wallet Balance</dt>
-            <dd>{(driver.walletBalance || 0).toFixed(2)} MRU</dd>
+            <dd>{Math.floor(driver.walletBalance || 0)} MRU</dd>
           </div>
         )}
       </dl>
@@ -397,6 +429,76 @@ export function DriverReviewCard({
                         {isCommission && (
                           <div className="wallet-history-admin" style={{ color: '#b91c1c' }}>
                             System: Commission deduction
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Ride History Section */}
+      {driver.accountStatus === "approved" && (
+        <div className="wallet-section">
+          <div className="wallet-history-section">
+            <button
+              className="wallet-history-toggle"
+              onClick={handleToggleRideHistory}
+            >
+              {showRideHistory ? "▼" : "▶"} Ride History
+            </button>
+            
+            {showRideHistory && (
+              <div className="wallet-history-list">
+                {isLoadingRideHistory ? (
+                  <div className="wallet-history-loading">Loading ride history...</div>
+                ) : rideHistory.length === 0 ? (
+                  <div className="wallet-history-empty">No rides yet</div>
+                ) : (
+                  rideHistory.map((ride: any) => {
+                    const tripCost = ride.charge || 0;
+                    const commission = ride.commission || 0;
+                    const netAmount = ride.netAmount || 0;
+                    const isCompleted = ride.status === "Completed";
+                    
+                    return (
+                      <div key={ride.id} className="wallet-history-item">
+                        <div className="wallet-history-header">
+                          <span className="wallet-history-amount">
+                            {isCompleted ? `Trip Cost: ${tripCost} MRU` : `Status: ${ride.status}`}
+                          </span>
+                          <span className="wallet-history-date">
+                            {new Date(ride.cratedAt).toLocaleString()}
+                          </span>
+                        </div>
+                        {isCompleted && (
+                          <>
+                            <div className="wallet-history-details">
+                              <span><strong>Trip Cost:</strong> {tripCost} MRU</span>
+                            </div>
+                            <div className="wallet-history-details">
+                              <span><strong>Commission (10%):</strong> {commission} MRU</span>
+                            </div>
+                            <div className="wallet-history-details" style={{ color: '#16a34a', fontWeight: '600' }}>
+                              <span><strong>Net Amount (Driver Received):</strong> {netAmount} MRU</span>
+                            </div>
+                            <div className="wallet-history-details" style={{ fontSize: '0.85rem', color: '#64748b', marginTop: '0.5rem' }}>
+                              <span>{ride.currentLocationName} → {ride.destinationLocationName}</span>
+                            </div>
+                            {ride.user && (
+                              <div className="wallet-history-admin" style={{ fontSize: '0.85rem', color: '#64748b' }}>
+                                Passenger: {ride.user.name || ride.user.phone_number || 'N/A'}
+                              </div>
+                            )}
+                          </>
+                        )}
+                        {!isCompleted && (
+                          <div className="wallet-history-details" style={{ fontSize: '0.85rem', color: '#64748b' }}>
+                            <span>{ride.currentLocationName} → {ride.destinationLocationName}</span>
                           </div>
                         )}
                       </div>

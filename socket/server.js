@@ -59,7 +59,156 @@ wss.on("listening", () => {
   console.log(`🌐 Accepting connections from: ws://localhost:${WS_PORT} or ws://YOUR_IP:${WS_PORT}`);
   console.log(`⚠️  Driver locations stored in memory (will be lost on server restart)`);
   console.log(`💡 For production, consider using Redis for persistent storage`);
+  
+  // Display status every 30 seconds
+  setInterval(() => {
+    displayServerStatus();
+  }, 30000);
+  
+  // Display initial status
+  setTimeout(() => {
+    displayServerStatus();
+  }, 5000); // Show status after 5 seconds
+  
+  // Periodic connection health check - clean up stale entries every 60 seconds
+  setInterval(() => {
+    // Clean up stale driver entries
+    Object.keys(driverIdToSocket).forEach(id => {
+      const socket = driverIdToSocket[id];
+      if (!socket || socket.readyState !== 1) {
+        console.log(`🧹 Removing stale driver entry: ${id}`);
+        delete driverIdToSocket[id];
+      }
+    });
+    
+    // Clean up stale user entries
+    Object.keys(userIdToSocket).forEach(id => {
+      const socket = userIdToSocket[id];
+      if (!socket || socket.readyState !== 1) {
+        console.log(`🧹 Removing stale user entry: ${id}`);
+        delete userIdToSocket[id];
+      }
+    });
+  }, 60000); // Every 60 seconds
 });
+
+// Function to display server status
+function displayServerStatus() {
+  const totalConnections = wss.clients.size;
+  
+  // Get all active driver IDs with open sockets
+  const activeDrivers = Object.keys(driverIdToSocket).filter(id => {
+    const socket = driverIdToSocket[id];
+    return socket && socket.readyState === 1; // OPEN
+  });
+  
+  // Get all active user IDs with open sockets
+  const activeUsers = Object.keys(userIdToSocket).filter(id => {
+    const socket = userIdToSocket[id];
+    return socket && socket.readyState === 1; // OPEN
+  });
+  
+  // Check for stale entries (sockets that are closed but still in mapping)
+  const staleDrivers = Object.keys(driverIdToSocket).filter(id => {
+    const socket = driverIdToSocket[id];
+    return socket && socket.readyState !== 1;
+  });
+  
+  const staleUsers = Object.keys(userIdToSocket).filter(id => {
+    const socket = userIdToSocket[id];
+    return socket && socket.readyState !== 1;
+  });
+  
+  // Clean up stale entries
+  if (staleDrivers.length > 0) {
+    console.log(`🧹 Cleaning up ${staleDrivers.length} stale driver entries...`);
+    staleDrivers.forEach(id => {
+      delete driverIdToSocket[id];
+    });
+  }
+  
+  if (staleUsers.length > 0) {
+    console.log(`🧹 Cleaning up ${staleUsers.length} stale user entries...`);
+    staleUsers.forEach(id => {
+      delete userIdToSocket[id];
+    });
+  }
+  
+  // Check for unidentified connections
+  const allIdentifiedSockets = new Set();
+  activeDrivers.forEach(id => {
+    if (driverIdToSocket[id]) allIdentifiedSockets.add(driverIdToSocket[id]);
+  });
+  activeUsers.forEach(id => {
+    if (userIdToSocket[id]) allIdentifiedSockets.add(userIdToSocket[id]);
+  });
+  
+  const unidentifiedConnections = Array.from(wss.clients).filter(ws => 
+    ws.readyState === 1 && !allIdentifiedSockets.has(ws)
+  );
+  
+  const driversWithLocation = Object.keys(drivers).filter(id => !drivers[id].stale).length;
+  const activeRideRequestsCount = Object.keys(activeRideRequests).length;
+  
+  console.log('\n' + '='.repeat(60));
+  console.log('📊 WEBSOCKET SERVER STATUS');
+  console.log('='.repeat(60));
+  console.log(`🔌 Total Active Connections: ${totalConnections}`);
+  console.log(`🚗 Active Drivers (identified): ${activeDrivers.length}`);
+  console.log(`👤 Active Users (identified): ${activeUsers.length}`);
+  console.log(`❓ Unidentified Connections: ${unidentifiedConnections.length}`);
+  console.log(`📍 Drivers with Location Data: ${driversWithLocation}`);
+  console.log(`🚕 Active Ride Requests: ${activeRideRequestsCount}`);
+  
+  if (activeDrivers > 0) {
+    console.log(`\n🚗 Active Driver IDs:`);
+    Object.keys(driverIdToSocket).forEach(id => {
+      const socket = driverIdToSocket[id];
+      if (socket && socket.readyState === 1) {
+        const hasLocation = drivers[id] && !drivers[id].stale;
+        const locationInfo = hasLocation 
+          ? `📍 (${drivers[id].latitude.toFixed(4)}, ${drivers[id].longitude.toFixed(4)})`
+          : '❌ (no location)';
+        console.log(`   - ${id} ${locationInfo}`);
+      }
+    });
+  }
+  
+  if (activeUsers > 0) {
+    console.log(`\n👤 Active User IDs:`);
+    Object.keys(userIdToSocket).forEach(id => {
+      const socket = userIdToSocket[id];
+      if (socket && socket.readyState === 1) {
+        const connectedAt = socket.connectedAt || 'unknown';
+        console.log(`   - ${id} (connected at: ${connectedAt})`);
+      } else if (socket) {
+        console.log(`   - ${id} ❌ (socket state: ${socket.readyState === 0 ? 'CONNECTING' : socket.readyState === 1 ? 'OPEN' : socket.readyState === 2 ? 'CLOSING' : 'CLOSED'})`);
+      }
+    });
+  } else {
+    console.log(`\n👤 No active users identified`);
+  }
+  
+  // Show unidentified connections with details
+  if (unidentifiedConnections.length > 0) {
+    console.log(`\n❓ Unidentified Connections (${unidentifiedConnections.length}):`);
+    unidentifiedConnections.forEach((ws, index) => {
+      const connectedAt = ws.connectedAt || 'unknown';
+      const lastMessage = ws.lastMessageTime ? `(last message: ${ws.lastMessageTime})` : '(no messages yet)';
+      console.log(`   ${index + 1}. Connected at: ${connectedAt} ${lastMessage}`);
+    });
+    console.log(`   💡 These connections should send an "identify" message with their userId/driverId`);
+  }
+  
+  if (totalConnections === 0) {
+    console.log(`\n⚠️  No active connections. Waiting for clients to connect...`);
+  } else if (totalConnections > 0 && activeDrivers === 0 && activeUsers === 0) {
+    console.log(`\n⚠️  ${totalConnections} connection(s) exist but none are identified yet.`);
+    console.log(`   💡 Clients should send an "identify" message after connecting.`);
+  }
+  
+  console.log('='.repeat(60) + '\n');
+}
 
 wss.on("error", (error) => {
   console.error("❌ WebSocket Server Error:", error);
@@ -67,27 +216,163 @@ wss.on("error", (error) => {
 
 wss.on("connection", (ws, req) => {
   const clientIP = req.socket.remoteAddress;
-  console.log(`✅ New WebSocket connection from: ${clientIP}`);
+  console.log(`\n✅ New WebSocket connection from: ${clientIP}`);
   console.log(`📊 Total active connections: ${wss.clients.size}`);
+  console.log(`🔗 Connection details:`, {
+    remoteAddress: clientIP,
+    remotePort: req.socket.remotePort,
+    localPort: req.socket.localPort,
+    protocol: req.headers['sec-websocket-protocol'] || 'none',
+    userAgent: req.headers['user-agent'] || 'unknown'
+  });
+  
+  // Track connection time for debugging
+  ws.connectedAt = new Date().toISOString();
+  
+  // Display updated status after new connection
+  setTimeout(() => {
+    const activeDrivers = Object.keys(driverIdToSocket).filter(id => {
+      const socket = driverIdToSocket[id];
+      return socket && socket.readyState === 1;
+    }).length;
+    const activeUsers = Object.keys(userIdToSocket).filter(id => {
+      const socket = userIdToSocket[id];
+      return socket && socket.readyState === 1;
+    }).length;
+    const unidentifiedConnections = wss.clients.size - activeDrivers - activeUsers;
+    console.log(`📊 Current status - Drivers: ${activeDrivers}, Users: ${activeUsers}, Unidentified: ${unidentifiedConnections}, Total Connections: ${wss.clients.size}`);
+    
+    if (unidentifiedConnections > 0) {
+      console.log(`⚠️  ${unidentifiedConnections} connection(s) not yet identified. Waiting for identify message...`);
+    }
+  }, 1000);
 
   ws.on("message", async (message) => {
     try {
       const data = JSON.parse(message);
+      ws.lastMessageTime = new Date().toISOString();
       console.log(`📨 Received message from ${clientIP}:`, data.type);
+      
+      // Log full message for identify messages to debug
+      if (data.type === "identify") {
+        console.log(`   📋 Identify message details:`, {
+          role: data.role,
+          userId: data.userId || 'missing',
+          driverId: data.driverId || 'missing',
+          hasUserId: !!data.userId,
+          hasDriverId: !!data.driverId,
+        });
+      }
+      
+      // Log if this is from an unidentified connection
+      if (!ws.userId && !ws.driverId && data.type !== "identify") {
+        console.log(`   ⚠️  Message from unidentified connection. Type: ${data.type}`);
+      }
 
       // Driver self-identification (so we can notify even before movement/location updates)
-      if (data.type === "identify" && data.role === "driver" && data.driverId) {
+      if (data.type === "identify" && data.role === "driver") {
+        if (!data.driverId) {
+          console.error(`❌ Driver identify message missing driverId:`, data);
+          if (ws.readyState === 1 /* OPEN */) {
+            ws.send(JSON.stringify({
+              type: "error",
+              message: "Driver identification failed: driverId is missing"
+            }));
+          }
+          return;
+        }
+        
         ws.driverId = data.driverId;
         driverIdToSocket[data.driverId] = ws;
         console.log(`🪪 Driver identified on WS: ${data.driverId}`);
+        console.log(`📊 Active drivers: ${Object.keys(driverIdToSocket).filter(id => driverIdToSocket[id]?.readyState === 1).length}`);
+        console.log(`📋 All driver IDs in mapping:`, Object.keys(driverIdToSocket));
+        
+        // Send confirmation back to driver
+        if (ws.readyState === 1 /* OPEN */) {
+          ws.send(JSON.stringify({
+            type: "identified",
+            role: "driver",
+            driverId: data.driverId,
+            message: "Successfully identified as driver"
+          }));
+        }
         return;
       }
 
       // User self-identification (so server can forward driver accept)
-      if (data.type === "identify" && data.role === "user" && data.userId) {
+      if (data.type === "identify" && data.role === "user") {
+        console.log(`🔍 Processing user identify message:`, {
+          hasUserId: !!data.userId,
+          userId: data.userId || 'MISSING',
+          socketState: ws.readyState === 1 ? 'OPEN' : ws.readyState === 0 ? 'CONNECTING' : ws.readyState === 2 ? 'CLOSING' : 'CLOSED',
+          clientIP: clientIP,
+        });
+        
+        if (!data.userId) {
+          console.error(`❌ User identify message missing userId:`, data);
+          console.error(`   Full message data:`, JSON.stringify(data, null, 2));
+          if (ws.readyState === 1 /* OPEN */) {
+            ws.send(JSON.stringify({
+              type: "error",
+              message: "User identification failed: userId is missing"
+            }));
+          }
+          return;
+        }
+        
+        // Check if this user ID is already mapped to a different socket
+        const existingSocket = userIdToSocket[data.userId];
+        if (existingSocket && existingSocket !== ws) {
+          // Close the old connection if it's different
+          if (existingSocket.readyState === 1) {
+            console.log(`🔄 User ${data.userId} reconnecting. Closing old connection.`);
+            try {
+              existingSocket.close();
+            } catch (e) {
+              console.warn(`⚠️  Error closing old socket:`, e);
+            }
+          }
+          delete userIdToSocket[data.userId];
+        }
+        
         ws.userId = data.userId;
         userIdToSocket[data.userId] = ws;
-        console.log(`🪪 User identified on WS: ${data.userId}`);
+        console.log(`🪪 ✅ User identified on WS: ${data.userId}`);
+        console.log(`   Connection details:`, {
+          connectedAt: ws.connectedAt,
+          readyState: ws.readyState === 1 ? 'OPEN' : ws.readyState === 0 ? 'CONNECTING' : ws.readyState === 2 ? 'CLOSING' : 'CLOSED',
+          clientIP: clientIP,
+          lastMessageTime: ws.lastMessageTime,
+        });
+        
+        const activeUsersCount = Object.keys(userIdToSocket).filter(id => userIdToSocket[id]?.readyState === 1).length;
+        console.log(`📊 Active users: ${activeUsersCount}`);
+        console.log(`📋 All user IDs in mapping:`, Object.keys(userIdToSocket));
+        
+        // Verify the mapping was successful
+        if (userIdToSocket[data.userId] === ws) {
+          console.log(`✅ User ${data.userId} successfully mapped to socket`);
+        } else {
+          console.error(`❌ ERROR: User ${data.userId} mapping failed!`);
+        }
+        
+        // Send confirmation back to user
+        if (ws.readyState === 1 /* OPEN */) {
+          try {
+            ws.send(JSON.stringify({
+              type: "identified",
+              role: "user",
+              userId: data.userId,
+              message: "Successfully identified as user"
+            }));
+            console.log(`✅ Sent identification confirmation to user ${data.userId}`);
+          } catch (error) {
+            console.error(`❌ Failed to send confirmation to user ${data.userId}:`, error);
+          }
+        } else {
+          console.warn(`⚠️  Could not send confirmation - socket state: ${ws.readyState}`);
+        }
         return;
       }
 
@@ -117,8 +402,43 @@ wss.on("connection", (ws, req) => {
       }
 
       if (data.type === "requestRide" && data.role === "user") {
+        // Validate required data
+        if (!data.latitude || !data.longitude) {
+          console.error(`❌ Invalid ride request: missing location data`);
+          if (ws.readyState === 1 /* OPEN */) {
+            ws.send(JSON.stringify({
+              type: "error",
+              message: "Invalid ride request: location data is missing"
+            }));
+          }
+          return;
+        }
+
+        if (!data.userId && !ws.userId) {
+          console.error(`❌ Invalid ride request: missing user ID`);
+          if (ws.readyState === 1 /* OPEN */) {
+            ws.send(JSON.stringify({
+              type: "error",
+              message: "Invalid ride request: user ID is missing. Please identify yourself first."
+            }));
+          }
+          return;
+        }
+
+        if (!data.marker && !data.destination) {
+          console.error(`❌ Invalid ride request: missing destination`);
+          if (ws.readyState === 1 /* OPEN */) {
+            ws.send(JSON.stringify({
+              type: "error",
+              message: "Invalid ride request: destination is missing"
+            }));
+          }
+          return;
+        }
+
         console.log(`🚗 Ride request from user at (${data.latitude}, ${data.longitude})`);
         console.log(`📊 Total drivers in memory: ${Object.keys(drivers).length}`);
+        console.log(`👤 User ID: ${data.userId || ws.userId}`);
         
         // Generate unique request ID
         const requestId = `ride_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
@@ -139,8 +459,8 @@ wss.on("connection", (ws, req) => {
           console.log(`⚠️  No drivers in memory! Driver may have disconnected.`);
         }
         
-        const nearbyDrivers = findNearbyDrivers(data.latitude, data.longitude);
-        console.log(`👥 Found ${nearbyDrivers.length} nearby drivers (within 5km)`);
+        const nearbyDrivers = await findNearbyDrivers(data.latitude, data.longitude);
+        console.log(`👥 Found ${nearbyDrivers.length} active nearby drivers (within 5km)`);
         
         // Log detailed info about nearby drivers
         if (nearbyDrivers.length > 0) {
@@ -397,7 +717,13 @@ wss.on("connection", (ws, req) => {
             const rideData = payload || rideRequest.payload;
             const distance = rideData?.distance || rideRequest.payload?.distance || "0";
             const driverRate = rideData?.driver?.rate || rideRequest.payload?.driver?.rate || "0";
-            const charge = (parseFloat(distance) * parseFloat(driverRate)).toFixed(2);
+            
+            // Calculate charge and truncate (drop all decimals)
+            const calculateCharge = (dist, rate) => {
+              const calculated = parseFloat(dist) * parseFloat(rate);
+              return Math.floor(calculated); // Drop all decimals, keep integer part only
+            };
+            const charge = calculateCharge(distance, driverRate);
             
             console.log(`🔨 [Server] Creating ride atomically for user ${userId} by driver ${driverId}...`, {
               distance,
@@ -412,7 +738,7 @@ wss.on("connection", (ws, req) => {
                 data: {
                   userId: userId,
                   driverId: driverId,
-                  charge: parseFloat(charge),
+                  charge: charge, // Already a number (even integer)
                   status: "Accepted", // Directly accepted - no pending
                   currentLocationName: rideData?.currentLocationName || rideRequest.payload?.currentLocationName || "",
                   destinationLocationName: rideData?.destinationLocationName || rideData?.destinationLocation || rideRequest.payload?.destinationLocationName || rideRequest.payload?.destinationLocation || "",
@@ -604,11 +930,70 @@ wss.on("connection", (ws, req) => {
         // This ensures other drivers get notified as fast as possible, before database operation completes
         console.log(`✅ [Server] Ride acceptance complete. Cancellation was already sent to other drivers when lock was acquired.`);
         
-        // Forward acceptance to user
+        // Fetch complete driver information from database to send to user
+        let driverInfo = null;
+        try {
+          const driverData = await prisma.driver.findUnique({
+            where: { id: driverId },
+            select: {
+              id: true,
+              name: true,
+              phone_number: true,
+              email: true,
+              avatar: true,
+              vehicle_type: true,
+              registration_number: true,
+              vehicle_color: true,
+              rate: true,
+              ratings: true,
+            },
+          });
+          
+          if (driverData) {
+            driverInfo = {
+              id: driverData.id,
+              name: driverData.name,
+              phone_number: driverData.phone_number,
+              email: driverData.email,
+              avatar: driverData.avatar || null,
+              vehicle_type: driverData.vehicle_type,
+              registration_number: driverData.registration_number,
+              vehicle_color: driverData.vehicle_color || null,
+              rate: driverData.rate,
+              ratings: driverData.ratings || 0,
+            };
+            console.log(`✅ [Server] Fetched driver info for user notification:`, {
+              driverId: driverInfo.id,
+              name: driverInfo.name,
+              hasAvatar: !!driverInfo.avatar,
+              vehicleType: driverInfo.vehicle_type,
+              registrationNumber: driverInfo.registration_number,
+            });
+          } else {
+            console.error(`❌ [Server] Driver ${driverId} not found in database`);
+          }
+        } catch (driverFetchError) {
+          console.error(`❌ [Server] Failed to fetch driver info:`, driverFetchError);
+          // Continue anyway - user will get basic info from payload
+        }
+        
+        // Prepare enhanced payload with complete driver information
+        const enhancedPayload = {
+          ...payload,
+          driver: driverInfo || payload.driver || null,
+          ride: rideData,
+        };
+        
+        // Forward acceptance to user with complete driver information
         const uSocket = userIdToSocket[userId];
         if (uSocket && uSocket.readyState === 1 /* OPEN */) {
-          console.log(`✅ Forwarding driver accept to user ${userId}`);
-          uSocket.send(JSON.stringify({ type: "rideAccepted", payload, requestId }));
+          console.log(`✅ Forwarding driver accept to user ${userId} with driver info`);
+          uSocket.send(JSON.stringify({ 
+            type: "rideAccepted", 
+            payload: enhancedPayload, 
+            requestId,
+            driver: driverInfo, // Include driver info at top level for easy access
+          }));
         } else {
           console.log(`⚠️ Unable to notify user ${userId}: not connected`);
         }
@@ -617,7 +1002,12 @@ wss.on("connection", (ws, req) => {
         wss.clients.forEach((client) => {
           try {
             if (client.readyState === 1 /* OPEN */) {
-              client.send(JSON.stringify({ type: "rideAccepted", payload, requestId }));
+              client.send(JSON.stringify({ 
+                type: "rideAccepted", 
+                payload: enhancedPayload, 
+                requestId,
+                driver: driverInfo,
+              }));
             }
           } catch {}
         });
@@ -637,7 +1027,35 @@ wss.on("connection", (ws, req) => {
 
   ws.on("close", (code, reason) => {
     console.log(`🔌 WebSocket connection closed from ${clientIP}. Code: ${code}, Reason: ${reason || 'None'}`);
+    if (ws.userId) {
+      console.log(`   👤 User ID: ${ws.userId}`);
+    }
+    if (ws.driverId) {
+      console.log(`   🚗 Driver ID: ${ws.driverId}`);
+    }
     console.log(`📊 Remaining active connections: ${wss.clients.size}`);
+    
+    // Update status after disconnect
+    const activeDrivers = Object.keys(driverIdToSocket).filter(id => {
+      const socket = driverIdToSocket[id];
+      return socket && socket.readyState === 1;
+    }).length;
+    const activeUsers = Object.keys(userIdToSocket).filter(id => {
+      const socket = userIdToSocket[id];
+      return socket && socket.readyState === 1;
+    }).length;
+    console.log(`📊 Active drivers: ${activeDrivers}, Active users: ${activeUsers}`);
+    
+    // Cleanup user mapping if present
+    if (ws.userId) {
+      if (userIdToSocket[ws.userId] === ws) {
+        delete userIdToSocket[ws.userId];
+        console.log(`🗑️  Removed user ${ws.userId} from mapping`);
+      } else if (userIdToSocket[ws.userId]) {
+        console.log(`⚠️  User ${ws.userId} mapping exists but points to different socket (reconnected?)`);
+        // Don't delete - the new connection is using it
+      }
+    }
     
     // For drivers: Don't immediately remove location on disconnect
     // Keep it for a short time in case they reconnect quickly
@@ -661,14 +1079,24 @@ wss.on("connection", (ws, req) => {
       drivers[driverId].stale = true;
       drivers[driverId].disconnectedAt = new Date().toISOString();
       // Remove socket mapping immediately
-      if (driverIdToSocket[driverId]) {
+      if (driverIdToSocket[driverId] === ws) {
         delete driverIdToSocket[driverId];
+        console.log(`🗑️  Removed driver ${driverId} from mapping`);
+      } else if (driverIdToSocket[driverId]) {
+        console.log(`⚠️  Driver ${driverId} mapping exists but points to different socket (reconnected?)`);
+        // Don't delete - the new connection is using it
       }
     }
 
     // Cleanup user mapping if present
-    if (ws.userId && userIdToSocket[ws.userId]) {
-      delete userIdToSocket[ws.userId];
+    if (ws.userId) {
+      if (userIdToSocket[ws.userId] === ws) {
+        delete userIdToSocket[ws.userId];
+        console.log(`🗑️  Removed user ${ws.userId} from mapping`);
+      } else if (userIdToSocket[ws.userId]) {
+        console.log(`⚠️  User ${ws.userId} mapping exists but points to different socket (reconnected?)`);
+        // Don't delete - the new connection is using it
+      }
     }
   });
 
@@ -680,17 +1108,24 @@ wss.on("connection", (ws, req) => {
   ws.send(JSON.stringify({ type: "connected", message: "Welcome to Flashride WebSocket Server" }));
 });
 
-const findNearbyDrivers = (userLat, userLon) => {
+const findNearbyDrivers = async (userLat, userLon) => {
   // Filter drivers stored in memory
   // Include both active and recently disconnected drivers (stale but within 30 seconds)
   const allDrivers = Object.entries(drivers);
   console.log(`🔍 Checking ${allDrivers.length} total drivers in memory for nearby matches...`);
   
-  const nearby = allDrivers
+  // First filter by distance
+  const nearbyByDistance = allDrivers
     .filter(([id, location]) => {
       // Skip if location data is invalid
       if (!location || typeof location.latitude !== 'number' || typeof location.longitude !== 'number') {
         console.log(`⚠️ Driver ${id} has invalid location data, skipping`);
+        return false;
+      }
+      
+      // Skip stale drivers (disconnected for more than 30 seconds)
+      if (location.stale) {
+        console.log(`⚠️ Driver ${id} is stale (disconnected), skipping`);
         return false;
       }
       
@@ -700,11 +1135,11 @@ const findNearbyDrivers = (userLat, userLon) => {
       );
       const distanceKm = distance / 1000;
       
-      // Include drivers within 5km, whether active or recently disconnected (but not stale for too long)
+      // Include drivers within 5km
       const isWithinRange = distance <= 5000; // 5 kilometers
       
       if (isWithinRange) {
-        console.log(`   ✓ Driver ${id}: ${distanceKm.toFixed(2)}km away (INCLUDED)`);
+        console.log(`   ✓ Driver ${id}: ${distanceKm.toFixed(2)}km away (distance OK)`);
       } else {
         console.log(`   ✗ Driver ${id}: ${distanceKm.toFixed(2)}km away (too far)`);
       }
@@ -718,8 +1153,56 @@ const findNearbyDrivers = (userLat, userLon) => {
       lastUpdate: location.lastUpdate 
     }));
   
-  console.log(`📊 Found ${nearby.length} drivers within 5km out of ${allDrivers.length} total drivers`);
-  return nearby;
+  console.log(`📊 Found ${nearbyByDistance.length} drivers within 5km (before status check)`);
+  
+  // Now verify drivers are active in database and have open WebSocket connections
+  const activeNearbyDrivers = [];
+  
+  for (const driver of nearbyByDistance) {
+    try {
+      // Check if driver has an open WebSocket connection
+      const driverSocket = driverIdToSocket[driver.id];
+      if (!driverSocket || driverSocket.readyState !== 1 /* OPEN */) {
+        console.log(`   ✗ Driver ${driver.id}: WebSocket not open, skipping`);
+        continue;
+      }
+      
+      // Check driver status in database (only if we have Prisma available)
+      try {
+        const dbDriver = await prisma.driver.findUnique({
+          where: { id: driver.id },
+          select: { id: true, status: true, accountStatus: true }
+        });
+        
+        if (!dbDriver) {
+          console.log(`   ✗ Driver ${driver.id}: Not found in database, skipping`);
+          continue;
+        }
+        
+        if (dbDriver.status !== "active") {
+          console.log(`   ✗ Driver ${driver.id}: Status is "${dbDriver.status}" (not active), skipping`);
+          continue;
+        }
+        
+        if (dbDriver.accountStatus !== "approved") {
+          console.log(`   ✗ Driver ${driver.id}: Account status is "${dbDriver.accountStatus}" (not approved), skipping`);
+          continue;
+        }
+        
+        console.log(`   ✅ Driver ${driver.id}: Active and approved, INCLUDED`);
+        activeNearbyDrivers.push(driver);
+      } catch (dbError) {
+        // If database check fails, still include driver if WebSocket is open (fallback)
+        console.warn(`   ⚠️ Driver ${driver.id}: Database check failed, but WebSocket is open - including anyway:`, dbError.message);
+        activeNearbyDrivers.push(driver);
+      }
+    } catch (error) {
+      console.error(`   ❌ Error checking driver ${driver.id}:`, error);
+    }
+  }
+  
+  console.log(`📊 Found ${activeNearbyDrivers.length} active drivers within 5km out of ${nearbyByDistance.length} nearby drivers`);
+  return activeNearbyDrivers;
 };
 
 // HTTP server is optional - only WebSocket server (port 8080) is required
@@ -735,9 +1218,20 @@ app.listen(PORT, (error) => {
 });
 */
 
+// Add command to manually display status (for debugging)
+// You can trigger this by sending SIGUSR1 signal: kill -USR1 <pid>
+// On Windows, you can use: node -e "process.kill(<pid>, 'SIGUSR1')"
+if (process.platform !== 'win32') {
+  process.on('SIGUSR1', () => {
+    console.log('\n📊 Manual status request received...');
+    displayServerStatus();
+  });
+}
+
 // Handle graceful shutdown
 process.on('SIGINT', () => {
   console.log('\n🛑 Shutting down WebSocket server...');
+  displayServerStatus(); // Show final status before shutdown
   wss.close(() => {
     console.log('✅ WebSocket server closed');
     process.exit(0);
@@ -746,6 +1240,7 @@ process.on('SIGINT', () => {
 
 process.on('SIGTERM', () => {
   console.log('\n🛑 Shutting down WebSocket server...');
+  displayServerStatus(); // Show final status before shutdown
   wss.close(() => {
     console.log('✅ WebSocket server closed');
     process.exit(0);

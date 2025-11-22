@@ -11,8 +11,8 @@ model user {
   id                String   @id @default(auto()) @map("_id") @db.ObjectId
   name              String?
   phone_number      String?
-  email             String?  @unique
-  googleId          String?  @unique
+  email             String?
+  googleId          String?
   authProvider      String   @default("otp")
   avatar            String?
   notificationToken String?
@@ -44,6 +44,7 @@ model driver {
   vehicle_color       String?
   rate                String
   password            String
+  avatar              String?
   notificationToken   String?
   ratings             Float       @default(0)
   totalEarning        Float       @default(0)
@@ -76,6 +77,9 @@ model rides {
   driver                  driver   @relation("DriverRides", fields: [driverId], references: [id])
   cratedAt                DateTime @default(now())
   updatedAt               DateTime @updatedAt
+
+  // Index for fast race condition checks (userId + status + cratedAt)
+  @@index([userId, status, cratedAt])
 }
 
 model admin {

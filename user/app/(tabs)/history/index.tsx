@@ -10,16 +10,40 @@ import { windowHeight } from "@/themes/app.constant";
 export default function History() {
   const [recentRides, setrecentRides] = useState([]);
   const getRecentRides = async () => {
-    const accessToken = await AsyncStorage.getItem("accessToken");
-    const res = await axios.get(
-      `${process.env.EXPO_PUBLIC_SERVER_URI}/get-rides`,
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
+    try {
+      const accessToken = await AsyncStorage.getItem("accessToken");
+      
+      if (!accessToken) {
+        console.error("[History] No access token found");
+        return;
       }
-    );
-    setrecentRides(res.data.rides);
+
+      console.log("[History] Fetching rides from:", `${process.env.EXPO_PUBLIC_SERVER_URI}/get-rides`);
+      
+      const res = await axios.get(
+        `${process.env.EXPO_PUBLIC_SERVER_URI}/get-rides`,
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        }
+      );
+      
+      console.log("[History] Response:", {
+        success: res.data.success,
+        ridesCount: res.data.rides?.length || 0,
+      });
+      
+      setrecentRides(res.data.rides || []);
+    } catch (error: any) {
+      console.error("[History] Error fetching rides:", error);
+      console.error("[History] Error details:", {
+        message: error?.message,
+        response: error?.response?.data,
+        status: error?.response?.status,
+      });
+      setrecentRides([]);
+    }
   };
 
   useEffect(() => {

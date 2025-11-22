@@ -24,6 +24,7 @@ import color from "@/themes/app.colors";
 import Button from "@/components/common/button";
 import axios from "axios";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { isNetworkError, getErrorMessage, validateServerUri } from "@/utils/api";
 import * as GeoLocation from "expo-location";
 import { Toast } from "react-native-toast-notifications";
 import { useGetDriverData } from "@/hooks/useGetDriverData";
@@ -111,88 +112,141 @@ export default function HomeScreen() {
       // Physical Android device - try to extract IP from SERVER_URI
       // Physical devices on same network can use the server IP directly
       const serverUri = process.env.EXPO_PUBLIC_SERVER_URI || '';
-      const ipMatch = serverUri.match(/http:\/\/([^:]+)/);
-      if (ipMatch && ipMatch[1] && !ipMatch[1].includes('localhost') && !ipMatch[1].includes('127.0.0.1') && !ipMatch[1].startsWith('10.0.2.')) {
-        console.log(`📱 Physical Android device, using ${ipMatch[1]}:8080`);
-        return `ws://${ipMatch[1]}:8080`;
+      console.log('📱 SERVER_URI:', serverUri);
+      
+      // Try multiple patterns to extract IP
+      let ipMatch = serverUri.match(/http:\/\/([^:\/]+)/);
+      if (!ipMatch) {
+        ipMatch = serverUri.match(/https?:\/\/([^:\/]+)/);
+      }
+      
+      if (ipMatch && ipMatch[1]) {
+        const extractedIp = ipMatch[1];
+        // Skip localhost, 127.0.0.1, and emulator IPs
+        if (!extractedIp.includes('localhost') && 
+            !extractedIp.includes('127.0.0.1') && 
+            !extractedIp.startsWith('10.0.2.') &&
+            extractedIp !== '0.0.0.0') {
+          const wsUrl = `ws://${extractedIp}:8080`;
+          console.log(`📱 Physical Android device, extracted IP from SERVER_URI: ${extractedIp}`);
+          console.log(`📱 Using WebSocket URL: ${wsUrl}`);
+          return wsUrl;
+        }
       }
       
       // Default to 10.0.2.2 for Android (works for emulator, won't work for physical device)
       // User should set EXPO_PUBLIC_WEBSOCKET_URL for physical devices
-      console.log('📱 Android - defaulting to 10.0.2.2:8080 (set EXPO_PUBLIC_WEBSOCKET_URL for physical devices)');
+      console.warn('⚠️ Android - Could not extract IP from SERVER_URI, defaulting to 10.0.2.2:8080');
+      console.warn('⚠️ For physical devices, set EXPO_PUBLIC_WEBSOCKET_URL in .env file');
       return 'ws://10.0.2.2:8080';
     }
     
     // For iOS or web, try to extract from SERVER_URI or use localhost
     const serverUri = process.env.EXPO_PUBLIC_SERVER_URI || '';
-    const ipMatch = serverUri.match(/http:\/\/([^:]+)/);
-    if (ipMatch && ipMatch[1] && !ipMatch[1].includes('localhost')) {
-      console.log(`📱 iOS/Web, using ${ipMatch[1]}:8080`);
-      return `ws://${ipMatch[1]}:8080`;
+    console.log('📱 SERVER_URI:', serverUri);
+    
+    let ipMatch = serverUri.match(/http:\/\/([^:\/]+)/);
+    if (!ipMatch) {
+      ipMatch = serverUri.match(/https?:\/\/([^:\/]+)/);
+    }
+    
+    if (ipMatch && ipMatch[1] && !ipMatch[1].includes('localhost') && !ipMatch[1].includes('127.0.0.1')) {
+      const wsUrl = `ws://${ipMatch[1]}:8080`;
+      console.log(`📱 iOS/Web, extracted IP: ${ipMatch[1]}`);
+      console.log(`📱 Using WebSocket URL: ${wsUrl}`);
+      return wsUrl;
     }
     
     // Fallback
-    console.log('📱 Using localhost fallback');
+    console.warn('⚠️ Using localhost fallback (may not work on physical devices)');
     return 'ws://localhost:8080';
   };
 
   const { colors } = useTheme();
 
-  Notifications.setNotificationHandler({
-    handleNotification: async () => ({
-      shouldShowAlert: true,
-      shouldPlaySound: true,
-      shouldSetBadge: false,
-      shouldShowBanner: true,
-      shouldShowList: true,
-    }),
-  });
+  // Check if we're in Expo Go (which doesn't support push notifications)
+  const isExpoGo = Constants?.executionEnvironment === 'storeClient';
+
+  // Only set up notification handler if not in Expo Go
+  if (!isExpoGo) {
+    try {
+      Notifications.setNotificationHandler({
+        handleNotification: async () => ({
+          shouldShowAlert: true,
+          shouldPlaySound: true,
+          shouldSetBadge: false,
+          shouldShowBanner: true,
+          shouldShowList: true,
+        }),
+      });
+    } catch (error) {
+      console.warn('[Notifications] Failed to set notification handler:', error);
+    }
+  }
 
   useEffect(() => {
-    notificationListener.current =
-      Notifications.addNotificationReceivedListener((notification) => {
-        // Handle the notification and extract data
-        const orderDataString = notification.request.content.data.orderData;
-        const orderData = JSON.parse(
-          typeof orderDataString === 'string' ? orderDataString : String(orderDataString)
-        );
-        setIsModalVisible(true);
-        setCurrentLocation({
-          latitude: orderData.currentLocation.latitude,
-          longitude: orderData.currentLocation.longitude,
+    // Only set up notification listener if not in Expo Go
+    if (isExpoGo) {
+      console.log('[Notifications] Skipping notification setup in Expo Go');
+      return;
+    }
+
+    try {
+      notificationListener.current =
+        Notifications.addNotificationReceivedListener((notification) => {
+          try {
+            // Handle the notification and extract data
+            const orderDataString = notification.request.content.data.orderData;
+            const orderData = JSON.parse(
+              typeof orderDataString === 'string' ? orderDataString : String(orderDataString)
+            );
+            setIsModalVisible(true);
+            setCurrentLocation({
+              latitude: orderData.currentLocation.latitude,
+              longitude: orderData.currentLocation.longitude,
+            });
+            setMarker({
+              latitude: orderData.marker.latitude,
+              longitude: orderData.marker.longitude,
+            });
+            setRegion({
+              latitude:
+                (orderData.currentLocation.latitude + orderData.marker.latitude) /
+                2,
+              longitude:
+                (orderData.currentLocation.longitude + orderData.marker.longitude) /
+                2,
+              latitudeDelta:
+                Math.abs(
+                  orderData.currentLocation.latitude - orderData.marker.latitude
+                ) * 2,
+              longitudeDelta:
+                Math.abs(
+                  orderData.currentLocation.longitude - orderData.marker.longitude
+                ) * 2,
+            });
+            setdistance(orderData.distance);
+            setcurrentLocationName(orderData.currentLocationName);
+            setdestinationLocationName(orderData.destinationLocation);
+            setUserData(orderData.user);
+          } catch (error) {
+            console.error('[Notifications] Error handling notification:', error);
+          }
         });
-        setMarker({
-          latitude: orderData.marker.latitude,
-          longitude: orderData.marker.longitude,
-        });
-        setRegion({
-          latitude:
-            (orderData.currentLocation.latitude + orderData.marker.latitude) /
-            2,
-          longitude:
-            (orderData.currentLocation.longitude + orderData.marker.longitude) /
-            2,
-          latitudeDelta:
-            Math.abs(
-              orderData.currentLocation.latitude - orderData.marker.latitude
-            ) * 2,
-          longitudeDelta:
-            Math.abs(
-              orderData.currentLocation.longitude - orderData.marker.longitude
-            ) * 2,
-        });
-        setdistance(orderData.distance);
-        setcurrentLocationName(orderData.currentLocationName);
-        setdestinationLocationName(orderData.destinationLocation);
-        setUserData(orderData.user);
-      });
+    } catch (error) {
+      console.warn('[Notifications] Failed to add notification listener:', error);
+    }
 
     return () => {
       if (notificationListener.current) {
-        notificationListener.current.remove();
+        try {
+          notificationListener.current.remove();
+        } catch (error) {
+          console.warn('[Notifications] Error removing listener:', error);
+        }
       }
     };
-  }, []);
+  }, [isExpoGo]);
 
   useEffect(() => {
     const fetchStatus = async () => {
@@ -213,11 +267,27 @@ export default function HomeScreen() {
   }, [driver]);
 
   useEffect(() => {
-    registerForPushNotificationsAsync();
-  }, []);
+    // Only register for push notifications if not in Expo Go
+    if (!isExpoGo) {
+      registerForPushNotificationsAsync();
+    } else {
+      console.log('[Notifications] Skipping push notification registration in Expo Go');
+    }
+  }, [isExpoGo]);
 
   async function registerForPushNotificationsAsync() {
-    if (Device.isDevice) {
+    try {
+      // Check if we're in Expo Go first
+      if (isExpoGo) {
+        console.log('[Notifications] Skipping push notification registration in Expo Go');
+        return;
+      }
+
+      if (!Device.isDevice) {
+        console.log('[Notifications] Not a physical device, skipping push notification registration');
+        return;
+      }
+
       const { status: existingStatus } =
         await Notifications.getPermissionsAsync();
       let finalStatus = existingStatus;
@@ -226,29 +296,39 @@ export default function HomeScreen() {
         finalStatus = status;
       }
       if (finalStatus !== "granted") {
-        Toast.show("Failed to get push token for push notification!", {
-          type: "danger",
-        });
+        console.warn("[Notifications] Permission not granted for push notifications");
         return;
       }
+      
       const projectId =
         Constants?.expoConfig?.extra?.eas?.projectId ??
         Constants?.easConfig?.projectId;
       if (!projectId) {
-        Toast.show("Failed to get project id for push notification!", {
-          type: "danger",
-        });
+        console.warn("[Notifications] No project ID found, cannot register push token");
+        return;
       }
+      
       try {
         const pushTokenString = (
           await Notifications.getExpoPushTokenAsync({
             projectId,
           })
         ).data;
-        console.log(pushTokenString);
+        console.log("[Notifications] Got push token:", pushTokenString.substring(0, 20) + "...");
+        
         // Register token with backend so users can notify this driver
         try {
           const accessToken = await AsyncStorage.getItem("accessToken");
+          if (!accessToken) {
+            console.warn("[Notifications] No access token, cannot register push token with backend");
+            return;
+          }
+          
+          if (!process.env.EXPO_PUBLIC_SERVER_URI) {
+            console.warn("[Notifications] No server URI configured, cannot register push token");
+            return;
+          }
+          
           await axios.post(
             `${process.env.EXPO_PUBLIC_SERVER_URI}/driver/register-push-token`,
             { token: pushTokenString },
@@ -256,30 +336,40 @@ export default function HomeScreen() {
               headers: {
                 Authorization: `Bearer ${accessToken}`,
               },
+              timeout: 10000, // 10 second timeout
             }
           );
-          console.log("[Notifications] Registered driver push token");
+          console.log("[Notifications] ✅ Registered driver push token with backend");
         } catch (e: any) {
-          console.log("[Notifications] Failed to register push token:", e?.message || e);
+          console.warn("[Notifications] Failed to register push token with backend:", e?.message || e);
         }
       } catch (e: unknown) {
-        Toast.show(`${e}`, {
-          type: "danger",
-        });
+        const errorMessage = e instanceof Error ? e.message : String(e);
+        console.warn("[Notifications] Failed to get push token:", errorMessage);
+        // Don't show toast for expected errors in development
+        if (!errorMessage.includes('Expo Go')) {
+          Toast.show(`Push notification error: ${errorMessage}`, {
+            type: "danger",
+          });
+        }
       }
-    } else {
-      Toast.show("Must use physical device for Push Notifications", {
-        type: "danger",
-      });
-    }
 
-    if (Platform.OS === "android") {
-      Notifications.setNotificationChannelAsync("default", {
-        name: "default",
-        importance: Notifications.AndroidImportance.MAX,
-        vibrationPattern: [0, 250, 250, 250],
-        lightColor: "#FF231F7C",
-      });
+      // Set up Android notification channel
+      if (Platform.OS === "android") {
+        try {
+          await Notifications.setNotificationChannelAsync("default", {
+            name: "default",
+            importance: Notifications.AndroidImportance.MAX,
+            vibrationPattern: [0, 250, 250, 250],
+            lightColor: "#FF231F7C",
+          });
+          console.log("[Notifications] ✅ Android notification channel set up");
+        } catch (error) {
+          console.warn("[Notifications] Failed to set up Android notification channel:", error);
+        }
+      }
+    } catch (error) {
+      console.error("[Notifications] Unexpected error in registerForPushNotificationsAsync:", error);
     }
   }
 
@@ -292,44 +382,6 @@ export default function HomeScreen() {
       wsRef.current = new WebSocket(wsUrl);
       const ws = wsRef.current;
 
-      ws.onopen = () => {
-        console.log("✅ Connected to WebSocket server");
-        setWsConnected(true);
-        
-        // Identify this driver to the WS server (so user can notify even before movement)
-        (async () => {
-          try {
-            const accessToken = await AsyncStorage.getItem("accessToken");
-            const res = await axios.get(
-              `${process.env.EXPO_PUBLIC_SERVER_URI}/driver/me`,
-              {
-                headers: { Authorization: `Bearer ${accessToken}` },
-              }
-            );
-            const driverId = res?.data?.driver?.id;
-            if (driverId) {
-              ws.send(
-                JSON.stringify({
-                  type: "identify",
-                  role: "driver",
-                  driverId,
-                })
-              );
-              console.log("🪪 Identified to WS as driver:", driverId);
-            }
-          } catch (e) {
-            console.log("⚠️ Failed to identify driver on WS:", e);
-          }
-        })();
-
-        // Send initial location update when connected (if driver is active and has location)
-        if (isOn && currentLocation) {
-          console.log("📡 WebSocket connected, sending initial location update");
-          setTimeout(() => {
-            sendLocationUpdate(currentLocation, true);
-          }, 1000); // Wait 1 second for connection to stabilize
-        }
-      };
 
       ws.onmessage = (e) => {
         try {
@@ -379,61 +431,42 @@ export default function HomeScreen() {
             setUserData(orderData.user);
           }
           
-          // Handle ride acceptance confirmation from server
+          // Handle ride acceptance confirmation from server (background - after navigation)
           if (message?.type === "rideAcceptedConfirmation") {
             const confirmedRequestId = message.requestId;
             const rideData = message?.ride; // Ride data created by server atomically
-            console.log(`✅ Received acceptance confirmation for request ${confirmedRequestId}`, {
+            console.log(`✅ [Background] Received acceptance confirmation for request ${confirmedRequestId}`, {
               rideId: rideData?.id,
               status: rideData?.status,
-              hasRideData: !!rideData,
-              messageKeys: Object.keys(message || {}),
-              rideDataKeys: rideData ? Object.keys(rideData) : [],
             });
             
-            // If we're waiting for confirmation, resolve the promise with ride data
-            if (acceptConfirmationRef.current && confirmedRequestId === currentRequestId) {
-              console.log(`✅ Confirmation matches current request, storing ride data and resolving IMMEDIATELY`, {
-                hasRideData: !!rideData,
-                rideId: rideData?.id,
-              });
-              // Store ride data from server (already created atomically)
-              if (acceptConfirmationRef.current) {
-                if (rideData) {
-                  acceptConfirmationRef.current.ride = rideData; // Store ride data
-                  console.log(`📦 Stored ride data in ref:`, {
-                    id: rideData.id,
-                    status: rideData.status,
-                  });
-                } else {
-                  console.warn(`⚠️ No ride data in confirmation message, but server confirmed - ride was created on server`);
-                }
-                // Resolve promise immediately - this will trigger navigation
-                acceptConfirmationRef.current.resolve(true);
-                // Keep ref alive briefly - acceptRideHandler will clear it after retrieving ride data
+            // Store ride data if we have the ref (for potential future use)
+            if (acceptConfirmationRef.current) {
+              if (rideData) {
+                acceptConfirmationRef.current.ride = rideData;
               }
-              setWaitingForConfirmation(false);
-            } else {
-              console.log(`⚠️ Confirmation received but not waiting for it or request ID mismatch`, {
-                hasRef: !!acceptConfirmationRef.current,
-                confirmedRequestId,
-                currentRequestId,
-              });
+              acceptConfirmationRef.current.resolve(true);
             }
+            // Note: We're already on the map screen, so no navigation needed
           }
           
-          // Handle ride request cancellation (when another driver accepts)
+          // Handle ride request cancellation (when another driver accepts) - CRITICAL for race condition
           if (message?.type === "rideRequestCancelled") {
             const cancelledRequestId = message.requestId;
-            console.log(`🚫 Ride request ${cancelledRequestId} was cancelled: ${message.reason || 'Accepted by another driver'}`);
-            console.log(`🚫 Current request ID: ${currentRequestId}, Cancelled request ID: ${cancelledRequestId}`);
+            console.log(`🚫 [Background] Ride request ${cancelledRequestId} was cancelled: ${message.reason || 'Accepted by another driver'}`);
             
-            // If we're waiting for confirmation, reject the promise
-            if (acceptConfirmationRef.current && cancelledRequestId === currentRequestId) {
-              console.log(`🚫 Request was cancelled while waiting for confirmation`);
+            // If this is the request we just accepted, navigate back and show error
+            if (acceptConfirmationRef.current) {
+              console.log(`🚫 [Background] Request was rejected - another driver got it first`);
               acceptConfirmationRef.current.reject(new Error("Request already accepted by another driver"));
               acceptConfirmationRef.current = null;
-              setWaitingForConfirmation(false);
+              
+              // Navigate back to home screen
+              router.back();
+              Toast.show("This ride was already accepted by another driver.", {
+                type: "info",
+                placement: "bottom",
+              });
             }
             
             // Close modal if this is the current request OR if modal is open (safety check)
@@ -476,43 +509,244 @@ export default function HomeScreen() {
       };
 
       ws.onerror = (e: any) => {
-        console.error("❌ WebSocket error:", e.message || 'Connection failed');
+        const errorMsg = e.message || 'Connection failed';
+        console.error("❌ WebSocket error:", errorMsg);
+        console.error("❌ WebSocket URL was:", wsUrl);
+        console.error("❌ Error details:", e);
         setWsConnected(false);
+        
+        // Show user-friendly error message
+        if (errorMsg.includes('failed to connect') || errorMsg.includes('Network')) {
+          Toast.show(
+            `Cannot connect to server at ${wsUrl}. Please check your network connection and ensure EXPO_PUBLIC_WEBSOCKET_URL is set correctly.`,
+            { type: "danger", duration: 5000 }
+          );
+        }
+      };
+
+      // Add connection timeout
+      const connectionTimeout = setTimeout(() => {
+        if (ws.readyState !== WebSocket.OPEN) {
+          console.error("❌ WebSocket connection timeout after 10 seconds");
+          console.error("❌ WebSocket URL:", wsUrl);
+          ws.close();
+          setWsConnected(false);
+          Toast.show(
+            `Connection timeout. Please check if the server is running at ${wsUrl}`,
+            { type: "danger", duration: 5000 }
+          );
+        }
+      }, 10000); // 10 second timeout
+
+      ws.onopen = () => {
+        clearTimeout(connectionTimeout);
+        console.log("✅ Connected to WebSocket server");
+        setWsConnected(true);
+        
+        // Identify this driver to the WS server (so user can notify even before movement)
+        (async () => {
+          try {
+            const accessToken = await AsyncStorage.getItem("accessToken");
+            if (!accessToken) {
+              console.warn("⚠️ No access token found, cannot identify driver");
+              return;
+            }
+            
+            const serverUri = process.env.EXPO_PUBLIC_SERVER_URI;
+            const validation = validateServerUri(serverUri);
+            
+            if (!validation.valid) {
+              console.error("❌ Server URI validation failed:", validation.message);
+              Toast.show(validation.message || "Server URL not configured. Please check your environment variables.", {
+                type: "danger",
+                duration: 5000
+              });
+              return;
+            }
+            
+            console.log("🪪 Attempting to identify driver at:", `${serverUri}/driver/me`);
+            
+            const res = await axios.get(
+              `${serverUri}/driver/me`,
+              {
+                headers: { Authorization: `Bearer ${accessToken}` },
+                timeout: 15000, // Increased to 15 seconds
+                validateStatus: (status) => status < 500, // Don't throw on 4xx errors
+              }
+            );
+            
+            const driverId = res?.data?.driver?.id;
+            if (driverId) {
+              ws.send(
+                JSON.stringify({
+                  type: "identify",
+                  role: "driver",
+                  driverId,
+                })
+              );
+              console.log("🪪 Identified to WS as driver:", driverId);
+            } else {
+              console.warn("⚠️ Driver ID not found in response");
+            }
+          } catch (e: any) {
+            console.error("⚠️ Failed to identify driver on WS:", e);
+            console.error("⚠️ Error details:", {
+              message: e?.message,
+              response: e?.response?.data,
+              status: e?.response?.status,
+              code: e?.code,
+              serverUri: process.env.EXPO_PUBLIC_SERVER_URI,
+            });
+            
+            const errorMessage = getErrorMessage(e);
+            
+            if (isNetworkError(e)) {
+              Toast.show("Cannot reach server. Please check:\n1. Server is running\n2. EXPO_PUBLIC_SERVER_URI is correct\n3. Device has internet connection", {
+                type: "danger",
+                duration: 6000
+              });
+            } else if (e?.code === 'ECONNABORTED' || e?.message?.includes('timeout')) {
+              Toast.show("Connection timeout. Please check your network connection.", {
+                type: "danger",
+                duration: 4000
+              });
+            } else {
+              Toast.show(errorMessage, {
+                type: "danger",
+                duration: 5000
+              });
+            }
+          }
+        })();
+
+        // Send initial location update when connected (if driver is active and has location)
+        if (isOn && currentLocation) {
+          console.log("📡 WebSocket connected, sending initial location update");
+          setTimeout(() => {
+            sendLocationUpdate(currentLocation, true);
+          }, 1000); // Wait 1 second for connection to stabilize
+        }
       };
 
       ws.onclose = (e) => {
+        clearTimeout(connectionTimeout);
         console.log("🔌 WebSocket closed:", e.code, e.reason || 'Connection closed');
+        console.log("🔌 Close code:", e.code);
+        console.log("🔌 Close reason:", e.reason);
         setWsConnected(false);
-        // Attempt to reconnect after a delay (only if not manually closed)
+        
+        // Don't reconnect if manually closed (code 1000) or if we've tried too many times
         if (e.code !== 1000) {
-          setTimeout(() => {
-            if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-              console.log('🔄 Attempting to reconnect WebSocket...');
-              // Reinitialize connection with event handlers
-              const newWs = new WebSocket(wsUrl);
-              newWs.onopen = () => {
-                console.log("✅ Reconnected to WebSocket server");
-                setWsConnected(true);
-              };
-              newWs.onmessage = (e) => {
-                try {
-                  const message = JSON.parse(e.data);
-                  console.log("📨 Received message:", message);
-                } catch (error) {
-                  console.error("❌ Failed to parse WebSocket message:", error);
-                }
-              };
-              newWs.onerror = (e: any) => {
-                console.error("❌ WebSocket error:", e.message || 'Connection failed');
-                setWsConnected(false);
-              };
-              newWs.onclose = (e) => {
-                console.log("🔌 WebSocket closed:", e.code, e.reason || 'Connection closed');
-                setWsConnected(false);
-              };
-              wsRef.current = newWs;
+          // Show error for common connection issues
+          if (e.code === 1006) {
+            console.error("❌ Abnormal closure - server may be unreachable");
+            console.error("❌ WebSocket URL was:", wsUrl);
+            Toast.show(
+              `Cannot reach server at ${wsUrl}. Please check:\n1. Server is running\n2. Device and server are on same network\n3. EXPO_PUBLIC_WEBSOCKET_URL is set correctly`,
+              { type: "danger", duration: 6000 }
+            );
+          }
+          
+          // Limit reconnection attempts to avoid infinite loops
+          const maxReconnectAttempts = 3;
+          let reconnectAttempts = 0;
+          
+          const attemptReconnect = () => {
+            if (reconnectAttempts >= maxReconnectAttempts) {
+              console.error("❌ Max reconnection attempts reached. Please check your network configuration.");
+              Toast.show(
+                "Failed to connect after multiple attempts. Please restart the app and check your network settings.",
+                { type: "danger", duration: 5000 }
+              );
+              return;
             }
-          }, 5000);
+            
+            reconnectAttempts++;
+            console.log(`🔄 Attempting to reconnect WebSocket (attempt ${reconnectAttempts}/${maxReconnectAttempts})...`);
+            
+            setTimeout(() => {
+              if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+                try {
+                  const newWs = new WebSocket(wsUrl);
+                  
+                  newWs.onopen = () => {
+                    console.log("✅ Reconnected to WebSocket server");
+                    setWsConnected(true);
+                    reconnectAttempts = 0; // Reset on successful connection
+                    
+                    // Re-identify driver
+                    (async () => {
+                      try {
+                        const accessToken = await AsyncStorage.getItem("accessToken");
+                        if (!accessToken) {
+                          console.warn("⚠️ No access token found on reconnect");
+                          return;
+                        }
+                        
+                        const serverUri = process.env.EXPO_PUBLIC_SERVER_URI;
+                        const validation = validateServerUri(serverUri);
+                        
+                        if (!validation.valid) {
+                          console.error("❌ Server URI validation failed on reconnect:", validation.message);
+                          return;
+                        }
+                        
+                        const res = await axios.get(
+                          `${serverUri}/driver/me`,
+                          {
+                            headers: { Authorization: `Bearer ${accessToken}` },
+                            timeout: 15000, // Increased timeout
+                            validateStatus: (status) => status < 500,
+                          }
+                        );
+                        const driverId = res?.data?.driver?.id;
+                        if (driverId) {
+                          newWs.send(
+                            JSON.stringify({
+                              type: "identify",
+                              role: "driver",
+                              driverId,
+                            })
+                          );
+                          console.log("🪪 Re-identified driver on reconnect:", driverId);
+                        }
+                      } catch (e: any) {
+                        console.error("⚠️ Failed to identify driver on reconnect:", e?.message || e);
+                        console.error("⚠️ Reconnect error details:", {
+                          message: e?.message,
+                          code: e?.code,
+                          isNetworkError: isNetworkError(e),
+                          serverUri: process.env.EXPO_PUBLIC_SERVER_URI,
+                        });
+                      }
+                    })();
+                  };
+                  
+                  newWs.onmessage = ws.onmessage;
+                  
+                  newWs.onerror = (e: any) => {
+                    console.error("❌ WebSocket reconnection error:", e.message || 'Connection failed');
+                    setWsConnected(false);
+                  };
+                  
+                  newWs.onclose = (e) => {
+                    console.log("🔌 WebSocket closed after reconnect attempt:", e.code);
+                    setWsConnected(false);
+                    if (e.code !== 1000) {
+                      attemptReconnect(); // Try again
+                    }
+                  };
+                  
+                  wsRef.current = newWs;
+                } catch (error) {
+                  console.error("❌ Failed to create reconnection WebSocket:", error);
+                  attemptReconnect(); // Try again after delay
+                }
+              }
+            }, 5000 * reconnectAttempts); // Exponential backoff
+          };
+          
+          attemptReconnect();
         }
       };
     } catch (error) {
@@ -947,8 +1181,20 @@ export default function HomeScreen() {
       console.log("[DriverStatus] Sending status update:", nextStatus);
       
       try {
+        if (!accessToken) {
+          throw new Error("No access token found");
+        }
+
+        const serverUri = process.env.EXPO_PUBLIC_SERVER_URI;
+        if (!serverUri) {
+          throw new Error("Server URI not configured");
+        }
+
+        console.log("[DriverStatus] Updating status to:", nextStatus);
+        console.log("[DriverStatus] API endpoint:", `${serverUri}/driver/update-status`);
+        
         const changeStatus = await axios.put(
-          `${process.env.EXPO_PUBLIC_SERVER_URI}/driver/update-status`,
+          `${serverUri}/driver/update-status`,
           {
             status: nextStatus,
           },
@@ -956,17 +1202,38 @@ export default function HomeScreen() {
             headers: {
               Authorization: `Bearer ${accessToken}`,
             },
+            timeout: 10000, // 10 second timeout
           }
         );
-        if (changeStatus.data) {
-          const nextIsOn = !isOn;
+
+        console.log("[DriverStatus] Response:", {
+          success: changeStatus.data?.success,
+          hasDriver: !!changeStatus.data?.driver,
+          driverStatus: changeStatus.data?.driver?.status,
+          statusCode: changeStatus.status,
+        });
+
+        if (changeStatus.data?.success && changeStatus.data?.driver) {
+          const updatedStatus = changeStatus.data.driver.status;
+          const nextIsOn = updatedStatus === "active";
+          
           setIsOn(nextIsOn);
           driverActiveRef.current = nextIsOn;
-          await AsyncStorage.setItem("status", changeStatus.data.driver.status);
+          await AsyncStorage.setItem("status", updatedStatus);
           setloading(false);
+          
           console.log(
             "[DriverStatus] Status updated successfully:",
-            changeStatus.data.driver.status
+            updatedStatus,
+            "isOn:", nextIsOn
+          );
+          
+          Toast.show(
+            nextIsOn ? "You are now online" : "You are now offline",
+            {
+              type: "success",
+              placement: "bottom",
+            }
           );
           
           // If driver just went "on", send location immediately so they can be found
@@ -981,16 +1248,34 @@ export default function HomeScreen() {
           }
         } else {
           setloading(false);
-          console.log("[DriverStatus] Status update response missing data");
+          console.error("[DriverStatus] Invalid response format:", changeStatus.data);
+          Toast.show("Invalid response from server. Please try again.", {
+            type: "danger",
+            placement: "bottom",
+          });
         }
       } catch (error: any) {
         setloading(false);
-        const errorMessage = error?.response?.data?.message || "Failed to update status";
+        console.error("[DriverStatus] Error updating status:", error);
+        console.error("[DriverStatus] Error details:", {
+          message: error?.message,
+          response: error?.response?.data,
+          status: error?.response?.status,
+          code: error?.code,
+        });
+        
+        const errorMessage = error?.response?.data?.message || 
+                            error?.message || 
+                            "Failed to update status. Please check your connection and try again.";
+        
         Toast.show(errorMessage, {
           type: "danger",
           placement: "bottom",
+          duration: 5000,
         });
-        console.error("[DriverStatus] Error updating status:", error);
+        
+        // Don't update state if request failed
+        console.log("[DriverStatus] Keeping current status due to error");
       }
     }
   };
@@ -1057,26 +1342,16 @@ export default function HomeScreen() {
         return;
       }
       
-      // Get driver ID for sending to server
-      const accessToken = await AsyncStorage.getItem("accessToken");
-      let driverId = driver?.id;
+      // OPTIMIZED: Use existing driver data - no API call needed
+      const driverId = driver?.id;
       if (!driverId) {
-        try {
-          const res = await axios.get(
-            `${process.env.EXPO_PUBLIC_SERVER_URI}/driver/me`,
-            {
-              headers: { Authorization: `Bearer ${accessToken}` },
-            }
-          );
-          driverId = res?.data?.driver?.id;
-        } catch (e) {
-          console.error("[Driver] Failed to get driver ID:", e);
-        }
+        console.error("[Driver] No driver ID available - driver data not loaded");
+        Toast.show("Driver data not available. Please try again.", { type: "danger" });
+        setAccepting(false);
+        return;
       }
       
-      // Notify the server via WS that the driver accepted
-      // Server will check database and only allow if no ride exists for this user
-      // Wait for server confirmation before creating ride in database
+      // Check WebSocket connection
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
         console.log("❌ WebSocket not open, cannot accept ride");
         Toast.show("Connection error. Please try again.", {
@@ -1087,7 +1362,28 @@ export default function HomeScreen() {
         return;
       }
 
-      // Send acceptance to server and wait for confirmation
+      // Set up async handler for server response (non-blocking)
+      acceptConfirmationRef.current = {
+        resolve: (value: boolean) => {
+          // Server confirmed - ride was created successfully
+          console.log(`✅ [Background] Server confirmed ride acceptance`);
+        },
+        reject: (error: any) => {
+          // Server rejected - another driver got it
+          console.error(`❌ [Background] Server rejected:`, error);
+          // Navigate back to home if we're on ride-details screen
+          if (error?.message?.includes("already accepted") || error?.message?.includes("cancelled")) {
+            router.back(); // Go back to home screen
+            Toast.show("This ride was already accepted by another driver.", {
+              type: "info",
+              placement: "bottom",
+            });
+          }
+        },
+        ride: null,
+      };
+
+      // Send acceptance to server (non-blocking - don't wait)
       wsRef.current.send(
         JSON.stringify({
           type: "driverAccept",
@@ -1101,205 +1397,33 @@ export default function HomeScreen() {
             marker,
             distance,
             currentLocationName,
-            destinationLocationName: destinationLocationName, // Use correct field name
-            destinationLocation: destinationLocationName, // Also include for backward compatibility
+            destinationLocationName: destinationLocationName,
+            destinationLocation: destinationLocationName,
             driver: {
               ...driver,
-              rate: driver?.rate, // Ensure rate is included
+              rate: driver?.rate,
             },
           },
         })
       );
-      console.log(`📣 Sent driverAccept via WS for request ${currentRequestId}, waiting for server confirmation...`);
+      console.log(`📣 [FAST] Sent driverAccept via WS - navigating immediately (not waiting for confirmation)`);
       
-      // Wait for server confirmation (with timeout) - server creates ride atomically
-      let serverConfirmed = false;
-      let storedRideData = null; // Store ride data separately
-      let confirmationReceived = false; // Track if we received confirmation
-      const confirmationPromise = new Promise<boolean>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          if (!confirmationReceived) {
-            console.log(`⏰ Server confirmation timeout after 5 seconds`);
-            resolve(false); // Timeout - no confirmation received
-          }
-        }, 5000); // 5 second timeout (increased from 3)
-
-        // Store the promise resolver
-        acceptConfirmationRef.current = {
-          resolve: (value: boolean) => {
-            clearTimeout(timeout);
-            confirmationReceived = true;
-            serverConfirmed = true;
-            // Store ride data from ref before resolving
-            storedRideData = acceptConfirmationRef.current?.ride || null;
-            console.log(`✅ Promise resolved, stored ride data:`, {
-              hasRideData: !!storedRideData,
-              rideId: storedRideData?.id,
-              serverConfirmed: true,
-            });
-            resolve(value);
-          },
-          reject: (error: any) => {
-            clearTimeout(timeout);
-            // If it's a cancellation, reject immediately
-            if (error?.message?.includes("already accepted") || error?.message?.includes("cancelled")) {
-              reject(error);
-            } else {
-              // For other errors, proceed optimistically
-              console.log(`⚠️ Server confirmation error, proceeding anyway:`, error);
-              resolve(false);
-            }
-          },
-          ride: null, // Initialize ride property
-        };
-      });
-
-      // Wait for server confirmation - server creates ride atomically
-      let wasCancelled = false;
-      try {
-        // Wait for server confirmation (but don't block if it times out)
-        await confirmationPromise;
-        console.log(`📡 [Driver] Confirmation promise resolved, serverConfirmed: ${serverConfirmed}, hasStoredRideData: ${!!storedRideData}`);
-      } catch (error: any) {
-        // Only handle cancellation errors - these mean ride was NOT created
-        if (error?.message?.includes("already accepted") || error?.message?.includes("cancelled")) {
-          console.error(`❌ Request was cancelled by server:`, error);
-          wasCancelled = true;
-          setAccepting(false);
-          setIsModalVisible(false);
-          setCurrentRequestId(null);
-          setUserData(null);
-          // Clear ref on cancellation
-          acceptConfirmationRef.current = null;
-          Toast.show("This ride request was already accepted by another driver.", {
-            type: "info",
-            placement: "bottom",
-          });
-          return;
-        }
-        // For other errors, proceed anyway (might be network delay)
-        console.log(`⚠️ Server confirmation issue, proceeding optimistically:`, error);
-      }
+      // OPTIMIZED: Use minimal ride data for immediate navigation
+      // Server will confirm/reject in background - we'll handle it asynchronously
+      const rideData = {
+        id: `temp_${Date.now()}`, // Temporary ID - will be updated when server confirms
+        status: "Accepted",
+        userId: userData.id,
+        driverId: driverId,
+      };
       
-      // If we received explicit cancellation, don't proceed
-      if (wasCancelled) {
-        return;
-      }
-      
-      // Retrieve ride data - try storedRideData first, then ref as fallback
-      let serverRideData = storedRideData;
-      if (!serverRideData && acceptConfirmationRef.current?.ride) {
-        serverRideData = acceptConfirmationRef.current.ride;
-        console.log(`📦 Retrieved ride data from ref fallback:`, {
-          rideId: serverRideData?.id,
-          status: serverRideData?.status,
-        });
-      }
-      
-      // Clear confirmation ref AFTER retrieving ride data
-      acceptConfirmationRef.current = null;
-      
-      // DECISION LOGIC: Only fail if we're CERTAIN the ride wasn't created
-      // If server confirmed OR we have ride data OR no cancellation was received → proceed
-      // Only fail if: no confirmation AND no ride data AND we're sure it failed
-      if (!serverConfirmed && !serverRideData) {
-        // Check if we received a cancellation message (would have been caught above)
-        // If we got here without cancellation, might be network delay - proceed optimistically
-        console.log(`⚠️ [Driver] No confirmation and no ride data, but no cancellation either - proceeding optimistically (ride might have been created)`);
-        // Don't fail - proceed with minimal ride object
-      }
-      
-      // If server confirmed, the ride was created on server even if we don't have the data
-      // IMPORTANT: If server confirmed but we don't have ride data, we MUST fetch it from database
-      // Don't use temp IDs - they won't work for status updates
-      let rideData = serverRideData;
-      
-      if (!rideData && serverConfirmed) {
-        // Server confirmed but no ride data - fetch it from database
-        console.log(`⚠️ [Driver] Server confirmed but no ride data - fetching from database...`);
-        try {
-          const response = await axios.get(
-            `${process.env.EXPO_PUBLIC_SERVER_URI}/driver/get-rides`,
-            {
-              headers: {
-                Authorization: `Bearer ${accessToken}`,
-              },
-            }
-          );
-          
-          const rides = response.data?.rides || response.data || [];
-          const actualRide = rides.find((ride: any) => 
-            String(ride.userId) === String(userData.id) && 
-            String(ride.driverId) === String(driverId) && 
-            (ride.status === "Accepted" || ride.status === "Processing")
-          );
-          
-          if (actualRide && actualRide.id) {
-            rideData = {
-              id: String(actualRide.id),
-              userId: String(actualRide.userId),
-              driverId: String(actualRide.driverId),
-              status: actualRide.status || "Accepted",
-              charge: actualRide.charge,
-              currentLocationName: actualRide.currentLocationName,
-              destinationLocationName: actualRide.destinationLocationName,
-              distance: actualRide.distance,
-            };
-            console.log(`✅ [Driver] Fetched actual ride from database: ${rideData.id}`);
-          } else {
-            console.error(`❌ [Driver] Could not find ride in database after server confirmation`);
-            // Still proceed but with temp ID - will be fixed in ride-details screen
-            rideData = { 
-              id: `temp_${Date.now()}`, 
-              status: "Accepted",
-              userId: userData.id,
-              driverId: driverId,
-            };
-          }
-        } catch (fetchError) {
-          console.error(`❌ [Driver] Failed to fetch ride from database:`, fetchError);
-          // Still proceed but with temp ID - will be fixed in ride-details screen
-          rideData = { 
-            id: `temp_${Date.now()}`, 
-            status: "Accepted",
-            userId: userData.id,
-            driverId: driverId,
-          };
-        }
-      } else if (!rideData) {
-        // No server confirmation and no ride data - use temp ID (will be fixed in ride-details)
-        rideData = { 
-          id: `temp_${Date.now()}`, 
-          status: "Accepted",
-          userId: userData.id,
-          driverId: driverId,
-        };
-      }
-      
-      console.log(`📝 [Driver] Final ride data to use - PROCEEDING TO NAVIGATION:`, {
+      // OPTIMIZED: Navigate immediately - don't wait for anything
+      console.log(`🚀 [FAST] Navigating immediately with optimistic ride data:`, {
         rideId: rideData.id,
         status: rideData.status,
-        hasValidRide: !!rideData.id,
-        serverConfirmed,
-        hasServerRideData: !!serverRideData,
-        willProceed: true,
-        reason: serverConfirmed ? 'Server confirmed' : serverRideData ? 'Has ride data' : 'Optimistic (no cancellation)',
+        userId: userData.id,
+        driverId: driverId,
       });
-
-      // Try to send push notification (non-blocking - don't prevent navigation)
-      try {
-        const data = {
-          ...driver,
-          currentLocation,
-          marker,
-          distance,
-        };
-        const driverPushToken = "ExponentPushToken[A22bNzKGUMegAXVEqzDnUx]";
-        await sendPushNotification(driverPushToken, data);
-      } catch (pushError) {
-        console.log(`⚠️ Failed to send push notification, but continuing:`, pushError);
-        // Don't block navigation for push notification errors
-      }
 
       // Clear request ID and modal BEFORE navigation
       setCurrentRequestId(null);
@@ -1327,27 +1451,13 @@ export default function HomeScreen() {
         return;
       }
       
-      // Get driver's current location quickly (with timeout to not block navigation)
-      let driverCurrentLoc = lastLocation; // Use last known location as fallback
-      try {
-        // Try to get fresh location, but don't wait too long
-        const locationPromise = GeoLocation.getCurrentPositionAsync({
-          accuracy: GeoLocation.Accuracy.Balanced,
-        });
-        const timeoutPromise = new Promise((_, reject) => 
-          setTimeout(() => reject(new Error("Location timeout")), 2000)
-        );
-        
-        const driverLoc = await Promise.race([locationPromise, timeoutPromise]) as any;
-        driverCurrentLoc = {
-          latitude: driverLoc.coords.latitude,
-          longitude: driverLoc.coords.longitude,
-        };
-        console.log(`[Driver] Got fresh driver location for navigation:`, driverCurrentLoc);
-      } catch (err) {
-        console.log(`[Driver] Using last known location or will fetch on ride-details screen`);
-        // Use last known location if available, otherwise ride-details will fetch it
-      }
+      // OPTIMIZED: Use last known location immediately - no GPS wait
+      const driverCurrentLoc = lastLocation || currentLocation || {
+        latitude: pickupLoc.latitude, // Fallback to pickup location
+        longitude: pickupLoc.longitude,
+      };
+      
+      console.log(`[Driver] Using location for navigation:`, driverCurrentLoc);
       
       // Prepare ride data - use ride from server (already created atomically)
       const rideDataForNavigation = {
@@ -1476,8 +1586,8 @@ export default function HomeScreen() {
           </View>
         )}
         
-        {/* Header overlay on top of map */}
-        <View style={{ position: 'absolute', top: 0, left: 0, right: 0, backgroundColor: 'rgba(255, 255, 255, 0.95)', zIndex: 10 }}>
+        {/* Header overlay on top of map - with gradient background */}
+        <View style={{ position: 'absolute', top: 0, left: 0, right: 0, zIndex: 10 }}>
           <Header 
             isOn={isOn} 
             toggleSwitch={() => handleStatusChange()} 
@@ -1486,21 +1596,24 @@ export default function HomeScreen() {
           />
         </View>
         
-        {/* Map Type Toggle Button - Bottom Right */}
+        {/* Map Type Toggle Button - Bottom Right - Enhanced */}
         <TouchableOpacity
           style={{
             position: 'absolute',
             bottom: 20,
             right: 20,
             backgroundColor: '#ffffff',
-            borderRadius: 8,
-            padding: 12,
+            borderRadius: 16,
+            paddingHorizontal: 16,
+            paddingVertical: 12,
             shadowColor: '#000',
-            shadowOffset: { width: 0, height: 2 },
-            shadowOpacity: 0.25,
-            shadowRadius: 3.84,
-            elevation: 5,
+            shadowOffset: { width: 0, height: 4 },
+            shadowOpacity: 0.3,
+            shadowRadius: 8,
+            elevation: 8,
             zIndex: 10,
+            borderWidth: 1,
+            borderColor: 'rgba(102, 126, 234, 0.2)',
           }}
           onPress={() => {
             // Cycle through: standard -> satellite -> hybrid -> standard
@@ -1513,7 +1626,7 @@ export default function HomeScreen() {
             }
           }}
         >
-          <Text style={{ fontSize: 12, fontWeight: '600', color: '#000' }}>
+          <Text style={{ fontSize: 13, fontWeight: '700', color: '#667eea', letterSpacing: 0.5 }}>
             {mapType === 'standard' ? '🗺️ Map' : mapType === 'satellite' ? '🛰️ Satellite' : '🌍 Hybrid'}
           </Text>
         </TouchableOpacity>
@@ -1649,7 +1762,7 @@ export default function HomeScreen() {
                 }}
               >
                 Amount:
-                {(distance * parseInt(driver?.rate!)).toFixed(2)} MRU
+                {Math.floor(distance * parseInt(driver?.rate!))} MRU
               </Text>
               <View
                 style={{

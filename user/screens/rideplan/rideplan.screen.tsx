@@ -10,6 +10,9 @@ import {
   Image,
   ActivityIndicator,
   TextInput,
+  Modal,
+  StyleSheet,
+  Linking,
 } from "react-native";
 import styles from "./styles";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -62,6 +65,7 @@ export default function RidePlanScreen() {
   const [driverLoader, setdriverLoader] = useState(false);
   const driverTimeoutRef = useRef<any>(null);
   const [assignedRide, setAssignedRide] = useState<any>(null); // set when driver accepts
+  const [showDriverInfoModal, setShowDriverInfoModal] = useState(false); // Modal to show driver info
   // Map type: 'standard' | 'satellite' | 'hybrid' | 'terrain'
   const [mapType, setMapType] = useState<'standard' | 'satellite' | 'hybrid' | 'terrain'>('standard');
   const [isUpdatingAddress, setIsUpdatingAddress] = useState(false); // Track if we're updating address from map interaction
@@ -218,58 +222,154 @@ export default function RidePlanScreen() {
   };
 
   const initializeWebSocket = () => {
+    // Close existing connection if any
+    if (ws.current) {
+      try {
+        if (ws.current.readyState === WebSocket.CONNECTING || ws.current.readyState === WebSocket.OPEN) {
+          ws.current.close();
+        }
+      } catch (e) {
+        console.log("[initializeWebSocket] Error closing existing connection:", e);
+      }
+    }
+
     const wsUrl = getWebSocketUrl();
     console.log('🔌 Connecting to WebSocket:', wsUrl);
     
     try {
       ws.current = new WebSocket(wsUrl);
-      ws.current.onopen = () => {
+      const wsInstance = ws.current;
+
+      // Add connection timeout
+      const connectionTimeout = setTimeout(() => {
+        if (wsInstance.readyState !== WebSocket.OPEN) {
+          console.error("❌ WebSocket connection timeout after 10 seconds");
+          console.error("❌ WebSocket URL:", wsUrl);
+          wsInstance.close();
+          setWsConnected(false);
+          Toast.show(
+            `Connection timeout. Please check if the server is running at ${wsUrl}`,
+            { type: "danger", duration: 5000 }
+          );
+        }
+      }, 10000); // 10 second timeout
+
+      wsInstance.onopen = () => {
+        clearTimeout(connectionTimeout);
         console.log("✅ Connected to WebSocket server");
         setWsConnected(true);
+        
         // Identify this user so server can forward accept events
-        try {
-          if (user?.id) {
-            ws.current?.send(
-              JSON.stringify({
+        // Try to identify immediately if user data is available
+        const identifyUser = () => {
+          try {
+            if (user?.id) {
+              const identifyMessage = {
                 type: "identify",
                 role: "user",
                 userId: user.id,
-              })
-            );
-            console.log("🪪 Identified to WS as user:", user.id);
+              };
+              wsInstance.send(JSON.stringify(identifyMessage));
+              console.log("🪪 Sent identify message to WS as user:", user.id);
+            } else {
+              console.warn("⚠️ User ID not available yet, will identify when user data loads");
+            }
+          } catch (error) {
+            console.error("❌ Failed to identify user on WebSocket:", error);
           }
-        } catch {}
+        };
+        
+        // Try immediately
+        identifyUser();
+        
+        // Also try after a short delay in case user data is still loading
+        setTimeout(() => {
+          if (user?.id && wsInstance.readyState === WebSocket.OPEN) {
+            identifyUser();
+          }
+        }, 1000);
       };
 
-      ws.current.onerror = (e: any) => {
-        console.error("❌ WebSocket error:", e.message || 'Connection failed');
+      // Handle messages from server
+      wsInstance.onmessage = (e: any) => {
+        try {
+          const message = JSON.parse(e.data);
+          
+          // Handle identification confirmation
+          if (message.type === "identified" && message.role === "user") {
+            console.log("✅ Server confirmed user identification:", message.userId);
+          }
+          
+          // Handle other messages (ride accepted, etc.) - this will be handled by getNearbyDrivers
+          // The existing message handler in getNearbyDrivers will process ride-related messages
+        } catch (error) {
+          console.error("❌ Failed to parse WebSocket message:", error);
+        }
+      };
+
+      wsInstance.onerror = (e: any) => {
+        clearTimeout(connectionTimeout);
+        const errorMsg = e.message || 'Connection failed';
+        console.error("❌ WebSocket error:", errorMsg);
+        console.error("❌ WebSocket URL was:", wsUrl);
         setWsConnected(false);
+        
+        // Show user-friendly error message
+        if (errorMsg.includes('failed to connect') || errorMsg.includes('Network')) {
+          Toast.show(
+            `Cannot connect to server at ${wsUrl}. Please check your network connection.`,
+            { type: "danger", duration: 5000 }
+          );
+        }
       };
 
-      ws.current.onclose = (e: any) => {
+      wsInstance.onclose = (e: any) => {
+        clearTimeout(connectionTimeout);
         console.log("🔌 WebSocket closed:", e.code, e.reason || 'Connection closed');
+        console.log("🔌 Close code:", e.code);
         setWsConnected(false);
+        
+        // Show error for common connection issues
+        if (e.code === 1006) {
+          console.error("❌ Abnormal closure - server may be unreachable");
+          console.error("❌ WebSocket URL was:", wsUrl);
+          Toast.show(
+            `Cannot reach server at ${wsUrl}. Please check:\n1. Server is running\n2. Device and server are on same network\n3. WebSocket URL is correct`,
+            { type: "danger", duration: 6000 }
+          );
+        }
+        
         // Attempt to reconnect after a delay (only if not manually closed)
         if (e.code !== 1000) {
           setTimeout(() => {
-            if (ws.current?.readyState !== WebSocket.OPEN) {
+            if (ws.current?.readyState !== WebSocket.OPEN && ws.current?.readyState !== WebSocket.CONNECTING) {
               console.log('🔄 Attempting to reconnect WebSocket...');
               initializeWebSocket();
             }
           }, 5000);
         }
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error('❌ Failed to create WebSocket:', error);
       setWsConnected(false);
+      Toast.show(
+        `Failed to create WebSocket connection: ${error?.message || 'Unknown error'}`,
+        { type: "danger", duration: 5000 }
+      );
     }
   };
 
   useEffect(() => {
+    // Initialize WebSocket when component mounts
     initializeWebSocket();
+    
     return () => {
       if (ws.current) {
-        ws.current.close();
+        try {
+          ws.current.close();
+        } catch (e) {
+          console.log("[cleanup] Error closing WebSocket:", e);
+        }
       }
       // Cleanup timeout
       if (driverTimeoutRef.current) {
@@ -278,6 +378,62 @@ export default function RidePlanScreen() {
       }
     };
   }, []);
+
+  // Re-identify user when user data becomes available
+  useEffect(() => {
+    if (user?.id) {
+      console.log("[useEffect] User data available, userId:", user.id, "WebSocket state:", ws.current?.readyState);
+      
+      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+        try {
+          const identifyMessage = {
+            type: "identify",
+            role: "user",
+            userId: user.id,
+          };
+          ws.current.send(JSON.stringify(identifyMessage));
+          console.log("🪪 Re-identified to WS as user:", user.id);
+        } catch (error) {
+          console.error("❌ Failed to re-identify user on WebSocket:", error);
+        }
+      } else if (ws.current && ws.current.readyState === WebSocket.CONNECTING) {
+        // WebSocket is connecting, wait for it to open then identify
+        console.log("[useEffect] WebSocket is connecting, will identify when open...");
+        const checkConnection = setInterval(() => {
+          if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+            clearInterval(checkConnection);
+            try {
+              ws.current.send(JSON.stringify({
+                type: "identify",
+                role: "user",
+                userId: user.id,
+              }));
+              console.log("🪪 Identified to WS as user (after connection):", user.id);
+            } catch (error) {
+              console.error("❌ Failed to identify user after connection:", error);
+            }
+          } else if (ws.current && (ws.current.readyState === WebSocket.CLOSED || ws.current.readyState === WebSocket.CLOSING)) {
+            clearInterval(checkConnection);
+            console.log("[useEffect] WebSocket closed, reconnecting...");
+            initializeWebSocket();
+          }
+        }, 500);
+        
+        // Clear interval after 10 seconds
+        setTimeout(() => clearInterval(checkConnection), 10000);
+      } else if (ws.current && ws.current.readyState !== WebSocket.OPEN) {
+        // If user data is available but WebSocket is not open, try to reconnect
+        console.log("[useEffect] User data available but WebSocket not open (state:", ws.current.readyState, "), reconnecting...");
+        initializeWebSocket();
+      } else if (!ws.current) {
+        // No WebSocket instance, initialize it
+        console.log("[useEffect] No WebSocket instance, initializing...");
+        initializeWebSocket();
+      }
+    } else {
+      console.log("[useEffect] User data not available yet, userId:", user?.id);
+    }
+  }, [user?.id]);
 
   useEffect(() => {
     // Only register for push notifications if not in Expo Go
@@ -697,11 +853,21 @@ export default function RidePlanScreen() {
             return;
           }
           console.log("[WS] rideAccepted (for me):", message.payload);
+          console.log("[WS] Driver info:", message.driver);
+          
+          // Merge driver info from message.driver into payload if available
+          const enhancedPayload = {
+            ...message.payload,
+            driver: message.driver || message.payload.driver || null,
+          };
+          
           setdriverLoader(false);
-          setAssignedRide(message.payload);
+          setAssignedRide(enhancedPayload);
           if (!marker && message.payload?.marker) {
             setMarker(message.payload.marker);
           }
+          // Show driver info modal when ride is accepted
+          setShowDriverInfoModal(true);
           Toast.show("Driver is on the way!", { type: "success", placement: "bottom" });
         }
       } catch (error) {
@@ -828,8 +994,13 @@ export default function RidePlanScreen() {
     if (!ws.current) {
       console.log("[requestNearbyDrivers] WebSocket not initialized, attempting to connect...");
       initializeWebSocket();
-      // Wait a moment for connection
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      // Wait for connection with timeout
+      let attempts = 0;
+      const maxAttempts = 10; // 5 seconds total (10 * 500ms)
+      while (attempts < maxAttempts && (!ws.current || ws.current.readyState !== WebSocket.OPEN)) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        attempts++;
+      }
     }
 
     // Check if WebSocket is actually open (more reliable than wsConnected state)
@@ -837,15 +1008,32 @@ export default function RidePlanScreen() {
     
     if (!isWsOpen) {
       console.log("[requestNearbyDrivers] WebSocket not open, state:", ws.current?.readyState);
-      console.log("[requestNearbyDrivers] Attempting to reconnect...");
+      console.log("[requestNearbyDrivers] State details:", {
+        hasWs: !!ws.current,
+        readyState: ws.current?.readyState,
+        stateName: ws.current?.readyState === 0 ? 'CONNECTING' : 
+                   ws.current?.readyState === 1 ? 'OPEN' : 
+                   ws.current?.readyState === 2 ? 'CLOSING' : 
+                   ws.current?.readyState === 3 ? 'CLOSED' : 'UNKNOWN'
+      });
       
       // Try to reconnect
+      console.log("[requestNearbyDrivers] Attempting to reconnect...");
       initializeWebSocket();
       
-      // Wait a bit for connection
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // Wait for connection with timeout
+      let attempts = 0;
+      const maxAttempts = 10; // 5 seconds total (10 * 500ms)
+      while (attempts < maxAttempts && (!ws.current || ws.current.readyState !== WebSocket.OPEN)) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        attempts++;
+        if (ws.current?.readyState === WebSocket.OPEN) {
+          console.log("[requestNearbyDrivers] Successfully reconnected!");
+          break;
+        }
+      }
       
-      // Check again
+      // Check again after waiting
       const isStillClosed = !ws.current || ws.current.readyState !== WebSocket.OPEN;
       if (isStillClosed) {
         if (driverTimeoutRef.current) {
@@ -887,30 +1075,48 @@ export default function RidePlanScreen() {
         console.log("[requestNearbyDrivers] Failed to get destination name:", e);
       }
       
+      // Validate user ID before sending
+      if (!user?.id) {
+        throw new Error("User ID not available. Please log in again.");
+      }
+
       // Double-check WebSocket is still open before sending
       if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
-        throw new Error("WebSocket connection lost");
+        throw new Error("WebSocket connection lost. Please try again.");
+      }
+
+      // Validate required data
+      if (!currentLocation || !marker) {
+        throw new Error("Location data is missing. Please try again.");
       }
       
+      const rideRequestData = {
+        type: "requestRide",
+        role: "user",
+        userId: user.id,
+        latitude: currentLocation.latitude,
+        longitude: currentLocation.longitude,
+        marker: marker,
+        distance: distance?.toFixed(2) || "0",
+        currentLocationName: currentLocationName,
+        destinationLocation: destinationLocationName,
+        destinationLocationName: destinationLocationName,
+        user: user,
+        userData: user,
+        vehicleType: selectedVehcile || "Car",
+      };
+
+      console.log("[requestNearbyDrivers] Sending ride request:", {
+        userId: rideRequestData.userId,
+        hasLocation: !!(rideRequestData.latitude && rideRequestData.longitude),
+        hasMarker: !!rideRequestData.marker,
+        distance: rideRequestData.distance,
+        vehicleType: rideRequestData.vehicleType,
+      });
+      
       // Send complete ride request with all necessary data
-      ws.current.send(
-        JSON.stringify({
-          type: "requestRide",
-          role: "user",
-          userId: user?.id,
-          latitude: currentLocation.latitude,
-          longitude: currentLocation.longitude,
-          marker: marker,
-          distance: distance?.toFixed(2) || "0",
-          currentLocationName: currentLocationName,
-          destinationLocation: destinationLocationName,
-          destinationLocationName: destinationLocationName,
-          user: user,
-          userData: user,
-          vehicleType: selectedVehcile || "Car",
-        })
-      );
-      console.log("[requestNearbyDrivers] Sent ride request to all nearby drivers");
+      ws.current.send(JSON.stringify(rideRequestData));
+      console.log("[requestNearbyDrivers] ✅ Ride request sent successfully to WebSocket server");
       getNearbyDrivers();
     } catch (error: any) {
       console.error("[requestNearbyDrivers] Error sending WebSocket message:", error);
@@ -1328,9 +1534,10 @@ export default function RidePlanScreen() {
                             }}
                           >
                             MRU{" "}
-                            {(
-                              distance.toFixed(2) * parseInt(driver.rate)
-                            ).toFixed(2)}
+                            {(() => {
+                              const calculated = parseFloat(distance.toFixed(2)) * parseInt(driver.rate);
+                              return Math.floor(calculated); // Drop all decimals
+                            })()}
                           </Text>
                         </View>
                       </Pressable>
@@ -1529,6 +1736,226 @@ export default function RidePlanScreen() {
           )}
         </View>
       </View>
+
+      {/* Driver Info Modal - Shows when driver accepts ride */}
+      <Modal
+        visible={showDriverInfoModal}
+        transparent={true}
+        animationType="slide"
+        onRequestClose={() => setShowDriverInfoModal(false)}
+      >
+        <View style={driverModalStyles.overlay}>
+          <View style={driverModalStyles.modalContainer}>
+            <View style={driverModalStyles.header}>
+              <Text style={driverModalStyles.headerTitle}>Driver is on the way!</Text>
+              <TouchableOpacity
+                onPress={() => setShowDriverInfoModal(false)}
+                style={driverModalStyles.closeButton}
+              >
+                <Text style={driverModalStyles.closeButtonText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+
+            {assignedRide?.driver && (
+              <View style={driverModalStyles.driverInfo}>
+                {/* Driver Photo */}
+                <View style={driverModalStyles.photoContainer}>
+                  {assignedRide.driver.avatar ? (
+                    <Image
+                      source={{ uri: assignedRide.driver.avatar }}
+                      style={driverModalStyles.driverPhoto}
+                      resizeMode="cover"
+                    />
+                  ) : (
+                    <View style={driverModalStyles.photoPlaceholder}>
+                      <Text style={driverModalStyles.photoInitials}>
+                        {assignedRide.driver.name
+                          ? assignedRide.driver.name
+                              .split(" ")
+                              .map((n: string) => n[0])
+                              .join("")
+                              .toUpperCase()
+                              .substring(0, 2)
+                          : "DR"}
+                      </Text>
+                    </View>
+                  )}
+                </View>
+
+                {/* Driver Name */}
+                <Text style={driverModalStyles.driverName}>
+                  {assignedRide.driver.name || "Driver"}
+                </Text>
+
+                {/* Phone Number */}
+                <TouchableOpacity
+                  style={driverModalStyles.phoneContainer}
+                  onPress={() => {
+                    if (assignedRide.driver.phone_number) {
+                      Linking.openURL(`tel:${assignedRide.driver.phone_number}`);
+                    }
+                  }}
+                >
+                  <Text style={driverModalStyles.phoneLabel}>📱 Phone:</Text>
+                  <Text style={driverModalStyles.phoneNumber}>
+                    {assignedRide.driver.phone_number || "N/A"}
+                  </Text>
+                </TouchableOpacity>
+
+                {/* Car Registration Number */}
+                {assignedRide.driver.registration_number && (
+                  <View style={driverModalStyles.registrationContainer}>
+                    <Text style={driverModalStyles.registrationLabel}>
+                      🚗 Car Number:
+                    </Text>
+                    <Text style={driverModalStyles.registrationNumber}>
+                      {assignedRide.driver.registration_number}
+                    </Text>
+                  </View>
+                )}
+
+                <TouchableOpacity
+                  style={driverModalStyles.okButton}
+                  onPress={() => setShowDriverInfoModal(false)}
+                >
+                  <Text style={driverModalStyles.okButtonText}>Got it!</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+          </View>
+        </View>
+      </Modal>
     </KeyboardAvoidingView>
   );
 }
+
+// Driver Info Modal Styles
+const driverModalStyles = StyleSheet.create({
+  overlay: {
+    flex: 1,
+    backgroundColor: "rgba(0, 0, 0, 0.5)",
+    justifyContent: "flex-end",
+  },
+  modalContainer: {
+    backgroundColor: "#fff",
+    borderTopLeftRadius: 25,
+    borderTopRightRadius: 25,
+    paddingBottom: windowHeight(30),
+    maxHeight: windowHeight(500),
+  },
+  header: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: windowWidth(20),
+    borderBottomWidth: 1,
+    borderBottomColor: "#e9ecef",
+  },
+  headerTitle: {
+    fontSize: 20,
+    fontWeight: "700",
+    color: "#333",
+  },
+  closeButton: {
+    width: 30,
+    height: 30,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  closeButtonText: {
+    fontSize: 24,
+    color: "#666",
+    fontWeight: "300",
+  },
+  driverInfo: {
+    padding: windowWidth(20),
+    alignItems: "center",
+  },
+  photoContainer: {
+    marginBottom: windowHeight(15),
+  },
+  driverPhoto: {
+    width: windowWidth(100),
+    height: windowWidth(100),
+    borderRadius: windowWidth(50),
+    borderWidth: 4,
+    borderColor: "#667eea",
+  },
+  photoPlaceholder: {
+    width: windowWidth(100),
+    height: windowWidth(100),
+    borderRadius: windowWidth(50),
+    backgroundColor: "#667eea",
+    justifyContent: "center",
+    alignItems: "center",
+    borderWidth: 4,
+    borderColor: "#764ba2",
+  },
+  photoInitials: {
+    fontSize: 36,
+    fontWeight: "700",
+    color: "#fff",
+  },
+  driverName: {
+    fontSize: 24,
+    fontWeight: "700",
+    color: "#333",
+    marginBottom: windowHeight(20),
+    textAlign: "center",
+  },
+  phoneContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#f8f9fa",
+    padding: windowWidth(15),
+    borderRadius: 12,
+    marginBottom: windowHeight(15),
+    width: "100%",
+  },
+  phoneLabel: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#666",
+    marginRight: windowWidth(10),
+  },
+  phoneNumber: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#667eea",
+  },
+  registrationContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#f8f9fa",
+    padding: windowWidth(15),
+    borderRadius: 12,
+    marginBottom: windowHeight(20),
+    width: "100%",
+  },
+  registrationLabel: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#666",
+    marginRight: windowWidth(10),
+  },
+  registrationNumber: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#333",
+  },
+  okButton: {
+    backgroundColor: "#667eea",
+    paddingVertical: windowHeight(15),
+    paddingHorizontal: windowWidth(60),
+    borderRadius: 12,
+    width: "100%",
+    alignItems: "center",
+  },
+  okButtonText: {
+    color: "#fff",
+    fontSize: 18,
+    fontWeight: "700",
+  },
+});

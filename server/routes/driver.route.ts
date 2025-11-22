@@ -8,6 +8,7 @@ import {
   registerDriver,
   updateDriverStatus,
   updatingRideStatus,
+  uploadProfilePicture,
 } from "../controllers/driver.controller";
 import { isAuthenticatedDriver } from "../middleware/isAuthenticated";
 
@@ -32,5 +33,7 @@ driverRouter.put(
 );
 
 driverRouter.get("/get-rides", isAuthenticatedDriver, getAllRides);
+
+driverRouter.put("/upload-profile-picture", isAuthenticatedDriver, uploadProfilePicture);
 
 export default driverRouter;

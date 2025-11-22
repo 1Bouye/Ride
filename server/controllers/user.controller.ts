@@ -622,29 +622,82 @@ export const completeProfile = async (req: Request, res: Response) => {
 // get logged in user data
 export const getLoggedInUserData = async (req: any, res: Response) => {
   try {
+    if (!req.user) {
+      console.error("[getLoggedInUserData] User data not found in request");
+      return res.status(404).json({
+        success: false,
+        message: "User data not found. Please log in again.",
+        user: null,
+      });
+    }
+
+    console.log(`[getLoggedInUserData] Fetching user data for: ${req.user.id}`);
     const user = req.user;
 
-    res.status(201).json({
+    console.log(`[getLoggedInUserData] Successfully returning user data:`, {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      phone: user.phone_number,
+    });
+
+    return res.status(200).json({
       success: true,
       user,
     });
-  } catch (error) {
-    console.log(error);
+  } catch (error: any) {
+    console.error("[getLoggedInUserData] Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch user data. Please try again.",
+      user: null,
+      error: error?.message || "Unknown error",
+    });
   }
 };
 
 // getting user rides
 export const getAllRides = async (req: any, res: Response) => {
-  const rides = await prisma.rides.findMany({
-    where: {
-      userId: req.user?.id,
-    },
-    include: {
-      driver: true,
-      user: true,
-    },
-  });
-  res.status(201).json({
-    rides,
-  });
+  try {
+    const userId = req.user?.id;
+    
+    if (!userId) {
+      console.error("[getAllRides] User ID not found in request");
+      return res.status(401).json({
+        success: false,
+        message: "User not authenticated",
+        rides: [],
+      });
+    }
+
+    console.log(`[getAllRides] Fetching rides for user: ${userId}`);
+    
+    const rides = await prisma.rides.findMany({
+      where: {
+        userId: userId,
+      },
+      include: {
+        driver: true,
+        user: true,
+      },
+      orderBy: {
+        cratedAt: "desc",
+      },
+    });
+
+    console.log(`[getAllRides] Found ${rides.length} rides for user ${userId}`);
+    
+    res.status(200).json({
+      success: true,
+      rides: rides || [],
+    });
+  } catch (error: any) {
+    console.error("[getAllRides] Error fetching rides:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch rides",
+      rides: [],
+      error: error?.message || "Unknown error",
+    });
+  }
 };

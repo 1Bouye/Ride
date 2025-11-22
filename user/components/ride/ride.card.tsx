@@ -31,7 +31,7 @@ export default function RideCard({ item }: { item: any }) {
             <View
               style={[styles.verticalBorder, { borderColor: colors.border }]}
             />
-            <Text style={styles.price}>MRU {item.charge}</Text>
+            <Text style={styles.price}>MRU {Math.round(item.charge)}</Text>
           </View>
         </View>
         <View style={[styles.alignment, { flexDirection: "row" }]}>

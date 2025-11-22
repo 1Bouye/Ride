@@ -8,7 +8,9 @@
     "dev": "ts-node-dev --respawn --transpile-only server.ts",
     "start": "node build/server.js",
     "create-admin": "ts-node scripts/create-admin.ts",
-    "check-admin": "ts-node scripts/check-admin.ts"
+    "check-admin": "ts-node scripts/check-admin.ts",
+    "prisma:generate": "prisma generate",
+    "prisma:fix": "powershell -ExecutionPolicy Bypass -File scripts/fix-prisma.ps1"
   },
   "keywords": [],
   "author": "shahriar sajeeb",

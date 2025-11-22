@@ -9,6 +9,8 @@ const styles = StyleSheet.create({
   },
   spaceBelow: {
     paddingBottom: windowHeight(10),
+    paddingTop: windowHeight(10),
+    backgroundColor: '#f8f9fa',
   },
   rideContainer: {
     paddingHorizontal: windowWidth(20),

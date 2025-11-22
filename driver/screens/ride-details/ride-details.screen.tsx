@@ -39,28 +39,38 @@ export default function RideDetailsScreen() {
   const regionInitializedRef = useRef(false);
   const lastRegionUpdateRef = useRef<string>("");
 
-  // Get driver's current location and keep it updated (especially important after pickup)
+  // OPTIMIZED: Use passed location immediately, fetch fresh location in background
   useEffect(() => {
-    // If driver location was already passed, use it initially
+    // Use passed driver location immediately (no wait)
     if (initialDriverLocation) {
-      console.log("[RideDetails] Using driver location from orderData:", initialDriverLocation);
+      console.log("[RideDetails] Using driver location from orderData immediately:", initialDriverLocation);
       setDriverLocation(initialDriverLocation);
     }
     
     let subscription: any = null;
     
-    // Always set up location tracking to keep driver location updated
+    // Fetch fresh location in background (non-blocking)
     (async () => {
       try {
         const { status } = await GeoLocation.requestForegroundPermissionsAsync();
         if (status === "granted") {
-          // Get initial location
-          const location = await GeoLocation.getCurrentPositionAsync({
-            accuracy: GeoLocation.Accuracy.Balanced,
-          });
-          const { latitude, longitude } = location.coords;
-          setDriverLocation({ latitude, longitude });
-          console.log("[RideDetails] Got driver location:", { latitude, longitude });
+          // Try to get fresh location, but don't block if it takes too long
+          try {
+            const locationPromise = GeoLocation.getCurrentPositionAsync({
+              accuracy: GeoLocation.Accuracy.Balanced,
+            });
+            const timeoutPromise = new Promise((_, reject) => 
+              setTimeout(() => reject(new Error("Location timeout")), 3000)
+            );
+            
+            const location = await Promise.race([locationPromise, timeoutPromise]) as any;
+            const { latitude, longitude } = location.coords;
+            setDriverLocation({ latitude, longitude });
+            console.log("[RideDetails] Updated driver location in background:", { latitude, longitude });
+          } catch (err) {
+            console.log("[RideDetails] Using passed location (fresh location fetch timed out)");
+            // Keep using initialDriverLocation
+          }
           
           // Watch position to keep driver location updated (especially after pickup)
           subscription = await GeoLocation.watchPositionAsync(
@@ -78,6 +88,7 @@ export default function RideDetailsScreen() {
         }
       } catch (error) {
         console.error("[RideDetails] Failed to get/update driver location:", error);
+        // Continue with initialDriverLocation if available
       }
     })();
     
@@ -98,6 +109,7 @@ export default function RideDetailsScreen() {
   }, []); // Only run once on mount
 
   // Update region based on status and available locations (with guards to prevent infinite loops)
+  // AUTOMATIC MAP UPDATES: Immediately show pickup location when ride is accepted, then dropoff when picked up
   useEffect(() => {
     // Create a unique key for this update to prevent duplicate updates
     const updateKey = `${orderStatus}-${driverLocation?.latitude?.toFixed(4)}-${driverLocation?.longitude?.toFixed(4)}`;
@@ -110,7 +122,7 @@ export default function RideDetailsScreen() {
     console.log(`[RideDetails] Updating region for status: ${orderStatus}`);
     
     if (orderStatus === "Accepted" || orderStatus === "Processing") {
-      // Before pickup: Show driver location → pickup location
+      // AUTOMATIC: Before pickup - Show driver location → pickup location immediately
       // Support both "Accepted" (new) and "Processing" (legacy) for backward compatibility
       if (pickupLocation && driverLocation) {
         const latitudeDelta = Math.abs(
@@ -127,10 +139,13 @@ export default function RideDetailsScreen() {
           longitudeDelta: Math.max(longitudeDelta, 0.0421),
         };
         
+        console.log(`[RideDetails] AUTOMATIC: Setting region for pickup (driver → pickup location)`);
         setRegion(newRegion);
         lastRegionUpdateRef.current = updateKey;
-      } else if (pickupLocation && !regionInitializedRef.current) {
-        // Initial setup: show pickup location if driver location not available yet
+        regionInitializedRef.current = true;
+      } else if (pickupLocation) {
+        // AUTOMATIC: Immediately show pickup location even if driver location not available yet
+        console.log(`[RideDetails] AUTOMATIC: Setting region to pickup location (driver location pending)`);
         setRegion({
           latitude: pickupLocation.latitude,
           longitude: pickupLocation.longitude,
@@ -141,7 +156,7 @@ export default function RideDetailsScreen() {
         lastRegionUpdateRef.current = updateKey;
       }
     } else if (orderStatus === "Ongoing") {
-      // After pickup: Show driver's current location → destination
+      // AUTOMATIC: After pickup - Immediately show driver's current location → destination
       if (driverLocation && destinationLocation) {
         const latitudeDelta = Math.abs(
           driverLocation.latitude - destinationLocation.latitude
@@ -157,11 +172,13 @@ export default function RideDetailsScreen() {
           longitudeDelta: Math.max(longitudeDelta, 0.0421),
         };
         
-        console.log(`[RideDetails] Setting region for Ongoing status (driver to destination):`, newRegion);
+        console.log(`[RideDetails] AUTOMATIC: Setting region for dropoff (driver → destination)`);
         setRegion(newRegion);
         lastRegionUpdateRef.current = updateKey;
-      } else if (destinationLocation && !regionInitializedRef.current) {
-        // Fallback: just show destination if driver location not available yet
+        regionInitializedRef.current = true;
+      } else if (destinationLocation) {
+        // AUTOMATIC: Immediately show destination even if driver location not available yet
+        console.log(`[RideDetails] AUTOMATIC: Setting region to destination (driver location pending)`);
         setRegion({
           latitude: destinationLocation.latitude,
           longitude: destinationLocation.longitude,
@@ -308,11 +325,11 @@ export default function RideDetailsScreen() {
         console.log(`[RideDetails] Status updated to: ${newStatus}`);
         
         if (newStatus === "Ongoing") {
-          // Update status immediately
+          // AUTOMATIC: Update status immediately - map will automatically update via useEffect
           setorderStatus(newStatus);
           
-          // Get driver's current location (where they are now, after pickup)
-          // Then update region to show driver's current location and destination
+          // AUTOMATIC: Get driver's current location (where they are now, after pickup)
+          // Map will automatically update to show driver → destination via useEffect
           (async () => {
             try {
               const currentLocation = await GeoLocation.getCurrentPositionAsync({
@@ -323,14 +340,17 @@ export default function RideDetailsScreen() {
                 longitude: currentLocation.coords.longitude,
               };
               
-              // Update driver location state
+              // Update driver location state - this will trigger useEffect to update map automatically
               setDriverLocation(driverCurrentLoc);
+              console.log(`[RideDetails] AUTOMATIC: Driver location updated, map will show dropoff route`);
               
-              // Driver location will be updated by the useEffect above, which will update the region
-              // No need to manually update region here
+              // Reset region update key to force map update
+              lastRegionUpdateRef.current = "";
             } catch (error) {
               console.error("[RideDetails] Failed to get driver location for region update:", error);
               // The useEffect will handle region update when driverLocation state updates
+              // Reset region update key to force map update even without driver location
+              lastRegionUpdateRef.current = "";
             }
           })();
           
@@ -534,7 +554,7 @@ export default function RideDetailsScreen() {
           }}
         >
           Payable amount:{" "}
-          {(orderData.distance * parseInt(orderData?.driver?.rate)).toFixed(2)}{" "}
+          {Math.floor(parseFloat(orderData.distance) * parseInt(orderData?.driver?.rate))}{" "}
           MRU
         </Text>
 

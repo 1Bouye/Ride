@@ -5,6 +5,7 @@ import {
   updateDriverReviewStatus,
   updateDriverWalletBalance,
   getDriverWalletHistory,
+  getDriverRides,
   deleteDriver,
 } from "../controllers/admin.controller";
 import { isAuthenticatedAdmin } from "../middleware/isAuthenticated";
@@ -27,6 +28,11 @@ adminRouter.get(
   "/drivers/:driverId/wallet/history",
   isAuthenticatedAdmin,
   getDriverWalletHistory
+);
+adminRouter.get(
+  "/drivers/:driverId/rides",
+  isAuthenticatedAdmin,
+  getDriverRides
 );
 adminRouter.delete(
   "/drivers/:driverId",

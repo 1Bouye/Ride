@@ -10,16 +10,40 @@ import { windowHeight } from "@/themes/app.constant";
 export default function Rides() {
   const [recentRides, setrecentRides] = useState([]);
   const getRecentRides = async () => {
-    const accessToken = await AsyncStorage.getItem("accessToken");
-    const res = await axios.get(
-      `${process.env.EXPO_PUBLIC_SERVER_URI}/driver/get-rides`,
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
+    try {
+      const accessToken = await AsyncStorage.getItem("accessToken");
+      
+      if (!accessToken) {
+        console.error("[Driver Rides] No access token found");
+        return;
       }
-    );
-    setrecentRides(res.data.rides);
+
+      console.log("[Driver Rides] Fetching rides from:", `${process.env.EXPO_PUBLIC_SERVER_URI}/driver/get-rides`);
+      
+      const res = await axios.get(
+        `${process.env.EXPO_PUBLIC_SERVER_URI}/driver/get-rides`,
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        }
+      );
+      
+      console.log("[Driver Rides] Response:", {
+        success: res.data.success,
+        ridesCount: res.data.rides?.length || 0,
+      });
+      
+      setrecentRides(res.data.rides || []);
+    } catch (error: any) {
+      console.error("[Driver Rides] Error fetching rides:", error);
+      console.error("[Driver Rides] Error details:", {
+        message: error?.message,
+        response: error?.response?.data,
+        status: error?.response?.status,
+      });
+      setrecentRides([]);
+    }
   };
 
   useEffect(() => {

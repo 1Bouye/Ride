@@ -78,27 +78,108 @@ export const nylas = new Nylas({
   apiUri: "https://api.eu.nylas.com",
 });
 
+// Request timeout middleware - prevent requests from hanging indefinitely
+app.use((req: Request, res: Response, next: NextFunction) => {
+  // Set a 30 second timeout for all requests
+  const timeout = 30000; // 30 seconds
+  const timer = setTimeout(() => {
+    if (!res.headersSent) {
+      console.error(`[Request Timeout] ${req.method} ${req.path} exceeded ${timeout}ms`);
+      res.status(504).json({
+        success: false,
+        message: "Request timeout. Please try again.",
+      });
+    }
+  }, timeout);
+
+  // Clear timeout when response is sent
+  res.on('finish', () => clearTimeout(timer));
+  res.on('close', () => clearTimeout(timer));
+  
+  next();
+});
+
+// Request logging middleware - log all incoming requests
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const timestamp = new Date().toISOString();
+  console.log(`\n[${timestamp}] ${req.method} ${req.path}`);
+  console.log(`[Request] Origin: ${req.headers.origin || 'none'}`);
+  console.log(`[Request] User-Agent: ${req.headers['user-agent']?.substring(0, 50) || 'none'}`);
+  console.log(`[Request] IP: ${req.ip || req.socket.remoteAddress || 'unknown'}`);
+  
+  // Log request body for POST/PUT requests (excluding sensitive data)
+  if (req.method === 'POST' || req.method === 'PUT') {
+    const bodyCopy = { ...req.body };
+    if (bodyCopy.password) {
+      bodyCopy.password = '[REDACTED]';
+    }
+    console.log(`[Request] Body keys:`, Object.keys(bodyCopy));
+  }
+  
+  // Track response time
+  const startTime = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - startTime;
+    const statusEmoji = res.statusCode >= 400 ? '❌' : res.statusCode >= 300 ? '⚠️' : '✅';
+    console.log(`${statusEmoji} [${timestamp}] ${req.method} ${req.path} - ${res.statusCode} (${duration}ms)`);
+  });
+  
+  next();
+});
+
 // body parser
 app.use(express.json({ limit: "50mb" }));
 
 // cookie parserv
 app.use(cookieParser());
 
+// CORS configuration - Allow all origins for development (React Native apps)
+// In production, restrict this to specific domains
 app.use(
   cors({
-    origin: [
-      "http://localhost:3000",
-      "http://localhost:3001",
-      "http://localhost:3002",
-      "http://localhost:4000",
-      "http://localhost:8081",
-      "http://localhost:8083",
-      "http://localhost:8084",
-      // Allow requests from the admin panel on any local IP
-      /^http:\/\/192\.168\.\d+\.\d+:3000$/,
-      /^http:\/\/192\.168\.\d+\.\d+:4000$/,
-    ],
+    origin: (origin, callback) => {
+      // Allow requests with no origin (like mobile apps, Postman, etc.)
+      if (!origin) {
+        return callback(null, true);
+      }
+      
+      // List of allowed origins
+      const allowedOrigins = [
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://localhost:3002",
+        "http://localhost:4000",
+        "http://localhost:8081",
+        "http://localhost:8083",
+        "http://localhost:8084",
+        // Allow any local IP for development
+        /^http:\/\/192\.168\.\d+\.\d+:\d+$/,
+        /^http:\/\/10\.\d+\.\d+\.\d+:\d+$/,
+        /^http:\/\/172\.(1[6-9]|2[0-9]|3[0-1])\.\d+\.\d+:\d+$/, // 172.16.0.0 - 172.31.255.255
+      ];
+      
+      // Check if origin matches any allowed pattern
+      const isAllowed = allowedOrigins.some(allowed => {
+        if (typeof allowed === 'string') {
+          return origin === allowed;
+        } else if (allowed instanceof RegExp) {
+          return allowed.test(origin);
+        }
+        return false;
+      });
+      
+      if (isAllowed) {
+        callback(null, true);
+      } else {
+        // For development, allow all origins (React Native apps)
+        // In production, you should restrict this
+        console.log(`[CORS] Allowing origin: ${origin} (development mode)`);
+        callback(null, true);
+      }
+    },
     credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   })
 );
 
@@ -107,11 +188,42 @@ app.use("/api/v1", userRouter);
 app.use("/api/v1/driver", driverRouter);
 app.use("/api/v1/admin", adminRouter);
 
+// Error handling middleware - must be after routes
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  console.error(`[Error Handler] Unhandled error for ${req.method} ${req.path}:`, err);
+  
+  if (!res.headersSent) {
+    res.status(500).json({
+      success: false,
+      message: err?.message || "Internal server error",
+    });
+  }
+});
+
+// 404 handler - must be last
+app.use((req: Request, res: Response) => {
+  console.warn(`[404] Route not found: ${req.method} ${req.path}`);
+  res.status(404).json({
+    success: false,
+    message: "Route not found",
+  });
+});
+
 // testing api
 app.get("/test", (req: Request, res: Response, next: NextFunction) => {
   res.status(200).json({
-    succcess: true,
+    success: true,
     message: "API is working",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Health check endpoint for driver registration
+app.get("/api/v1/driver/health", (req: Request, res: Response) => {
+  res.status(200).json({
+    success: true,
+    message: "Driver API is accessible",
+    timestamp: new Date().toISOString(),
   });
 });
 
